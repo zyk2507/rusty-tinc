@@ -1,0 +1,19 @@
+[workspace]
+members = [
+  "crates/tinc-core",
+  "crates/tinc-runtime",
+  "crates/tinc-test-support",
+  "crates/tincctl",
+  "crates/tincd",
+]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+license = "GPL-2.0-or-later"
+version = "1.1.0-alpha.0"
+authors = [
+  "Ivo Timmermans",
+  "Guus Sliepen <guus@tinc-vpn.org>",
+  "tinc Rust rewrite contributors",
+]

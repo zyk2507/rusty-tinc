@@ -1,0 +1,33 @@
+[package]
+name = "tincd"
+description = "Rust tinc daemon entry point"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "tincd"
+path = "src/main.rs"
+
+[dependencies]
+getrandom = "0.2"
+libc = "0.2"
+rsa = { version = "0.9", features = ["pem"] }
+sha2 = "0.10"
+roxmltree = "0.20"
+tinc-core = { path = "../tinc-core" }
+tinc-runtime = { path = "../tinc-runtime", default-features = false }
+url = "2"
+
+[features]
+default = ["lzo", "openssl-legacy"]
+jumbograms = ["tinc-core/jumbograms", "tinc-runtime/jumbograms"]
+lzo = ["tinc-runtime/lzo"]
+openssl-legacy = ["tinc-runtime/openssl-legacy"]
+vde = []
+
+[dev-dependencies]
+rand_core = { version = "0.6", features = ["getrandom"] }
+tincctl = { path = "../tincctl", default-features = false }
+tinc-test-support = { path = "../tinc-test-support" }

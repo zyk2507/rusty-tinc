@@ -1,0 +1,107 @@
+name: Test
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  full-test:
+    name: Full test suite
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    env:
+      CARGO_HOME: /home/runner/.cargo
+      CARGO_TERM_COLOR: always
+      DEBIAN_FRONTEND: noninteractive
+      RUSTUP_HOME: /home/runner/.rustup
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup component add rustfmt
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            arping \
+            build-essential \
+            iperf3 \
+            iproute2 \
+            iptables \
+            iputils-ping \
+            liblz4-dev \
+            liblzo2-dev \
+            libssl-dev \
+            meson \
+            ninja-build \
+            pkg-config \
+            tcpdump \
+            zlib1g-dev
+
+      - name: Prepare tun device
+        run: |
+          sudo modprobe tun || true
+          if [ ! -e /dev/net/tun ]; then
+            sudo mkdir -p /dev/net
+            sudo mknod /dev/net/tun c 10 200
+          fi
+          sudo chmod 666 /dev/net/tun
+
+      - name: Build C tinc reference binaries
+        run: |
+          common_options=(
+            -Ddocs=disabled
+            -Dtests=disabled
+            -Dsystemd=disabled
+            -Dminiupnpc=disabled
+            -Dreadline=disabled
+            -Dcurses=disabled
+            -Dlzo=disabled
+          )
+
+          meson setup vendor/tinc/build-c vendor/tinc \
+            "${common_options[@]}" \
+            -Dzlib=disabled \
+            -Dlz4=disabled
+          ninja -C vendor/tinc/build-c
+
+          meson setup vendor/tinc/build-c-zlib vendor/tinc \
+            "${common_options[@]}" \
+            -Dzlib=enabled \
+            -Dlz4=disabled
+          ninja -C vendor/tinc/build-c-zlib
+
+          meson setup vendor/tinc/build-c-lz4 vendor/tinc \
+            "${common_options[@]}" \
+            -Dzlib=disabled \
+            -Dlz4=enabled
+          ninja -C vendor/tinc/build-c-lz4
+
+          meson setup vendor/tinc/build-c-compression vendor/tinc \
+            "${common_options[@]}" \
+            -Dzlib=enabled \
+            -Dlz4=enabled
+          ninja -C vendor/tinc/build-c-compression
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run complete test suite
+        run: |
+          sudo -E env \
+            PATH="$PATH" \
+            CARGO_HOME="$CARGO_HOME" \
+            RUSTUP_HOME="$RUSTUP_HOME" \
+            TINC_NETNS_STRICT=1 \
+            cargo test --workspace --all-targets

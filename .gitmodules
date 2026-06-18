@@ -1,0 +1,4 @@
+[submodule "vendor/tinc"]
+	path = vendor/tinc
+	url = https://github.com/gsliepen/tinc.git
+	branch = 1.1

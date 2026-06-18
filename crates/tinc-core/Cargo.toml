@@ -1,0 +1,21 @@
+[package]
+name = "tinc-core"
+description = "Core protocol and routing primitives for the Rust tinc rewrite"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+authors.workspace = true
+
+[lib]
+name = "tinc_core"
+path = "src/lib.rs"
+
+[dependencies]
+sha2 = "0.10"
+
+[features]
+default = []
+jumbograms = []
+
+[dev-dependencies]
+tinc-test-support = { path = "../tinc-test-support" }

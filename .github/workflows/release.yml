@@ -1,0 +1,153 @@
+name: Release Binaries
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-binaries
+  cancel-in-progress: false
+
+jobs:
+  version:
+    name: Compute release version
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+
+    steps:
+      - name: Compute date-based version from GitHub releases
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TZ: Asia/Hong_Kong
+        run: |
+          set -euo pipefail
+
+          base="$(date +'%y.%-m.%-d')"
+          base_re="${base//./\\.}"
+          max_release=-1
+
+          while IFS= read -r tag_name; do
+            if [[ "$tag_name" =~ ^v?${base_re}\.([0-9]+)$ ]]; then
+              release_number="${BASH_REMATCH[1]}"
+              if (( release_number > max_release )); then
+                max_release="$release_number"
+              fi
+            fi
+          done < <(gh api --paginate "/repos/${GITHUB_REPOSITORY}/releases" --jq '.[].tag_name')
+
+          next_release=$((max_release + 1))
+          version="${base}.${next_release}"
+
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${version}" >> "$GITHUB_OUTPUT"
+          echo "Computed release version ${version}"
+
+  build:
+    name: Build ${{ matrix.asset_arch }}
+    needs: version
+    runs-on: ${{ matrix.runner }}
+    env:
+      CARGO_TERM_COLOR: always
+      DEBIAN_FRONTEND: noninteractive
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            asset_arch: amd64
+          - runner: ubuntu-24.04-arm
+            asset_arch: arm64
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            liblzo2-dev \
+            libssl-dev \
+            pkg-config
+
+      - name: Build Rust binaries
+        run: |
+          cargo build --release -p tincctl --bin tinc
+          cargo build --release -p tincd --bin tincd
+
+      - name: Package binaries
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          ASSET_ARCH: ${{ matrix.asset_arch }}
+        run: |
+          set -euo pipefail
+
+          os="linux"
+          package="tinc-${VERSION}-${os}-${ASSET_ARCH}"
+          mkdir -p "dist/${package}"
+
+          cp target/release/tinc "dist/${package}/tinc"
+          cp target/release/tincd "dist/${package}/tincd"
+          cp README.md COPYING "dist/${package}/"
+
+          strip "dist/${package}/tinc" "dist/${package}/tincd" || true
+
+          tar -C dist -czf "dist/${package}.tar.gz" "${package}"
+          sha256sum "dist/${package}.tar.gz" > "dist/${package}.tar.gz.sha256"
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tinc-${{ needs.version.outputs.version }}-linux-${{ matrix.asset_arch }}
+          path: |
+            dist/tinc-${{ needs.version.outputs.version }}-linux-${{ matrix.asset_arch }}.tar.gz
+            dist/tinc-${{ needs.version.outputs.version }}-linux-${{ matrix.asset_arch }}.tar.gz.sha256
+          if-no-files-found: error
+
+  release:
+    name: Create GitHub release
+    needs:
+      - version
+      - build
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Download binary artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.version.outputs.version }}
+          TAG: ${{ needs.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          gh release create "${TAG}" \
+            dist/tinc-${VERSION}-linux-amd64.tar.gz \
+            dist/tinc-${VERSION}-linux-amd64.tar.gz.sha256 \
+            dist/tinc-${VERSION}-linux-arm64.tar.gz \
+            dist/tinc-${VERSION}-linux-arm64.tar.gz.sha256 \
+            --target "${GITHUB_SHA}" \
+            --title "rusty-tinc ${VERSION}" \
+            --notes "Automated rusty-tinc Linux binary release for ${VERSION}."

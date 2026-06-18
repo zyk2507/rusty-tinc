@@ -1,0 +1,11 @@
+[package]
+name = "tinc-test-support"
+description = "Shared test helpers for the Rust tinc rewrite"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+authors.workspace = true
+
+[lib]
+name = "tinc_test_support"
+path = "src/lib.rs"

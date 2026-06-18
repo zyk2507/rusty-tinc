@@ -1,0 +1,66 @@
+# Rust build output.
+/target/
+
+# Local C reference builds used only by interoperability tests.
+/vendor/tinc/build-c/
+/vendor/tinc/build-c-zlib/
+/vendor/tinc/build-c-compression/
+/vendor/tinc/build-c-lz4/
+/vendor/tinc/build*/
+
+# Native build output and generated compile metadata.
+/build/
+/build-*/
+/_build/
+meson-logs/
+meson-private/
+.ninja_deps
+.ninja_log
+compile_commands.json
+
+# Test reports, logs, and local run artifacts.
+/rust-full-test-per-item-logs-*/
+/rust-full-test-per-item-progress-*.json
+/rust-full-test-per-item-results-*.jsonl
+/rust-full-test-per-item-report-*.md
+/rust-full-test-timing-report.md
+/rust-test-timing-report.md
+*.log
+*.tmp
+*.temp
+
+# Coverage and profiling output.
+*.profraw
+*.profdata
+coverage/
+tarpaulin-report.html
+cobertura.xml
+lcov.info
+
+# Binary/object artifacts that should come from the build system.
+*.a
+*.d
+*.dll
+*.dylib
+*.exe
+*.o
+*.out
+*.rlib
+*.so
+
+# Local backups and editor swap files.
+*.bak
+*.orig
+*.rej
+*.swp
+*.swo
+**/*.rs.bk
+*~
+/tinc-rewrite-backup-*.tar.gz
+
+# Local editor, tool, and OS metadata.
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+.cache/
