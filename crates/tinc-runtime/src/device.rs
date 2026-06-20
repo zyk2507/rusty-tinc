@@ -3,6 +3,8 @@
 use std::collections::VecDeque;
 use std::fmt;
 use std::io::{self, Read, Write};
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, RawFd};
 
 use tinc_core::route::{ETH_HLEN, ETH_P_IP, ETH_P_IPV6};
 
@@ -544,8 +546,23 @@ impl<T: Read + Write> Device for FileDevice<T> {
 
     fn write_packet(&mut self, packet: &VpnPacket) -> Result<(), DeviceError> {
         let frame = encode_device_frame(self.mode, packet)?;
-        self.inner.write_all(&frame)?;
+        match self.inner.write(&frame) {
+            Ok(_) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                ) => {}
+            Err(error) => return Err(DeviceError::Io(error)),
+        }
         Ok(())
+    }
+}
+
+#[cfg(unix)]
+impl<T: AsRawFd> AsRawFd for FileDevice<T> {
+    fn as_raw_fd(&self) -> RawFd {
+        self.inner.as_raw_fd()
     }
 }
 

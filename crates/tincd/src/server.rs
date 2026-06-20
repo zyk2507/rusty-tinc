@@ -118,82 +118,14 @@ pub(crate) fn write_startup_error_to_umbilical_like_tinc(_error: &TincdError) {}
 
 #[cfg(not(unix))]
 pub fn run_foreground_server(
-    config: &RuntimeConfig,
-    endpoint: &ControlEndpoint,
-    keys: RuntimeKeys,
-    options: &TincdOptions,
+    _config: &RuntimeConfig,
+    _endpoint: &ControlEndpoint,
+    _keys: RuntimeKeys,
+    _options: &TincdOptions,
 ) -> Result<(), TincdError> {
-    let mut config = runtime_config_for_keys(config, &keys);
-    apply_memory_lock(options.lock_memory)?;
-    let listen_sockets = match bind_runtime_listeners(&config) {
-        Ok(sockets) => sockets,
-        Err(error) => {
-            write_startup_error_to_umbilical_like_tinc(&error);
-            return Err(error);
-        }
-    };
-    let mut runtime = RuntimeDaemonState::new_configured(listen_sockets, &config, keys)?;
-    runtime.set_bypass_security(options.bypass_security);
-    runtime.set_debug_level(effective_debug_level(&config, options));
-    if let Some(logfile) = resolve_logfile(options) {
-        runtime.enable_logfile(&logfile)?;
-    } else {
-        runtime.enable_stderr_log(false);
-    }
-    apply_process_priority(config.daemon.process_priority)?;
-
-    let control_listener = bind_tcp_control_socket(endpoint)?;
-    let runtime_endpoint = endpoint.for_tcp_control_listener(&control_listener)?;
-    write_control_pidfile(&runtime_endpoint)?;
-
-    let runtime_confbase = resolve_confbase(options);
-    runtime.set_confbase(runtime_confbase.clone());
-    runtime.enable_scripts(&config, options);
-    runtime.enable_invitations(runtime_confbase, &config)?;
-
-    let result = control_listener
-        .set_nonblocking(true)
-        .map_err(control_io)
-        .and_then(|()| {
-            if !runtime.device_standby {
-                runtime
-                    .device
-                    .enable()
-                    .map_err(|error| device_error("enable", error))?;
-                run_daemon_script("tinc-up", &config, options, runtime.device.info(), &[])?;
-            }
-            runtime.run_local_subnet_up_scripts();
-            apply_sandbox(&config, options)?;
-            initialize_upnp_like_tinc(&mut runtime, &config);
-            runtime.record_log_with_priority(0, LOG_NOTICE, "Ready");
-            notify_umbilical_success()?;
-            runtime.retry_configured_peers(&config)?;
-            Ok(())
-        })
-        .and_then(|()| {
-            run_tcp_foreground_event_loop(
-                &mut config,
-                &runtime_endpoint,
-                &control_listener,
-                &mut runtime,
-                options,
-            )
-        });
-    let down_result = if runtime.device_standby {
-        Ok(false)
-    } else {
-        run_daemon_script("tinc-down", &config, options, runtime.device.info(), &[]).and_then(
-            |_| {
-                runtime
-                    .device
-                    .disable()
-                    .map_err(|error| device_error("disable", error))
-                    .map(|_| true)
-            },
-        )
-    };
-    remove_control_files(&runtime_endpoint);
-    result.and(down_result.map(|_| ()))
+    Err(TincdError::RuntimeState(
+        "non-Unix foreground daemon runtime is not implemented; it must use an event loop equivalent to tinc's Windows WSA event loop before being enabled".to_owned(),
+    ))
 }
 
 #[cfg(unix)]
@@ -261,79 +193,39 @@ pub(crate) fn run_foreground_event_loop(
     options: &TincdOptions,
     signals: &RuntimeSignalHandlers,
 ) -> Result<(), TincdError> {
-    let mut next_autoconnect_check = Instant::now() + AUTOCONNECT_INTERVAL;
     let mut watchdog = RuntimeWatchdog::from_env();
+    let mut event_poll = RuntimeEventPoll::new()?;
     watchdog.start(runtime);
 
     let result = (|| -> Result<(), TincdError> {
         loop {
             watchdog.maybe_ping(Instant::now());
 
-            if handle_runtime_signal_actions(config, runtime, options, signals)? {
-                return Ok(());
-            }
-
-            if accept_control_connections(
+            let autoconnected = runtime.run_timers_once_with_periodic(Some(config))? > 0;
+            let retried = runtime.retry_configured_peers(config)? > 0;
+            let autoconnect_retried = runtime.retry_autoconnect_outgoing_like_tinc(config)? > 0;
+            let timeout = if retried || autoconnected || autoconnect_retried {
+                Some(Duration::ZERO)
+            } else {
+                runtime_event_wait_timeout(runtime, &watchdog)
+            };
+            match event_poll.poll_ready(
                 config,
                 endpoint,
+                runtime,
                 control_listener,
-                Some(&mut *runtime),
-                Some(options),
+                options,
+                signals,
+                timeout,
             )? {
-                return Ok(());
-            }
-
-            let did_work = runtime.poll_once()?;
-            let retried = runtime.retry_configured_peers(config)? > 0;
-            let autoconnected = if config.autoconnect && Instant::now() >= next_autoconnect_check {
-                next_autoconnect_check = Instant::now() + AUTOCONNECT_INTERVAL;
-                runtime.do_autoconnect_like_tinc(config)? > 0
-            } else {
-                false
-            };
-            if !did_work && !retried && !autoconnected {
-                thread::sleep(FOREGROUND_IDLE_SLEEP);
+                RuntimeEventPollOutcome::Continue { .. } => {}
+                RuntimeEventPollOutcome::Stop => return Ok(()),
             }
         }
     })();
 
     watchdog.stop();
     result
-}
-
-#[cfg(not(unix))]
-pub(crate) fn run_tcp_foreground_event_loop(
-    config: &mut RuntimeConfig,
-    endpoint: &ControlEndpoint,
-    control_listener: &TcpListener,
-    runtime: &mut RuntimeDaemonState,
-    options: &TincdOptions,
-) -> Result<(), TincdError> {
-    let mut next_autoconnect_check = Instant::now() + AUTOCONNECT_INTERVAL;
-
-    loop {
-        if accept_tcp_control_connections(
-            config,
-            endpoint,
-            control_listener,
-            Some(&mut *runtime),
-            Some(options),
-        )? {
-            return Ok(());
-        }
-
-        let did_work = runtime.poll_once()?;
-        let retried = runtime.retry_configured_peers(config)? > 0;
-        let autoconnected = if config.autoconnect && Instant::now() >= next_autoconnect_check {
-            next_autoconnect_check = Instant::now() + AUTOCONNECT_INTERVAL;
-            runtime.do_autoconnect_like_tinc(config)? > 0
-        } else {
-            false
-        };
-        if !did_work && !retried && !autoconnected {
-            thread::sleep(FOREGROUND_IDLE_SLEEP);
-        }
-    }
 }
 
 #[cfg(unix)]
@@ -377,31 +269,40 @@ pub(crate) fn handle_runtime_signal_actions(
 }
 
 #[cfg(unix)]
-pub(crate) fn accept_control_connections(
+pub(crate) enum ControlAcceptProgress {
+    Stop,
+    Accepted,
+    NotReady,
+}
+
+#[cfg(unix)]
+pub(crate) fn accept_control_connection_once_progress(
     config: &mut RuntimeConfig,
     endpoint: &ControlEndpoint,
     listener: &std::os::unix::net::UnixListener,
-    mut runtime: Option<&mut RuntimeDaemonState>,
+    runtime: Option<&mut RuntimeDaemonState>,
     reload_options: Option<&TincdOptions>,
-) -> Result<bool, TincdError> {
-    loop {
-        match listener.accept() {
-            Ok((stream, _)) => {
-                let name = config.name.clone();
-                if handle_control_stream(
-                    stream,
-                    &name,
-                    endpoint,
-                    Some(config),
-                    runtime.as_deref_mut(),
-                    reload_options,
-                )? {
-                    return Ok(true);
-                }
+) -> Result<ControlAcceptProgress, TincdError> {
+    match listener.accept() {
+        Ok((stream, _)) => {
+            let name = config.name.clone();
+            if handle_control_stream(
+                stream,
+                &name,
+                endpoint,
+                Some(config),
+                runtime,
+                reload_options,
+            )? {
+                Ok(ControlAcceptProgress::Stop)
+            } else {
+                Ok(ControlAcceptProgress::Accepted)
             }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(false),
-            Err(error) => return Err(control_io(error)),
         }
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+            Ok(ControlAcceptProgress::NotReady)
+        }
+        Err(error) => Err(control_io(error)),
     }
 }
 
@@ -585,7 +486,7 @@ impl ControlStreamResponse {
 
 pub(crate) trait ControlStream: Read + Write {
     fn clone_read(&self) -> io::Result<Box<dyn BufRead>>;
-    fn clone_write(&self) -> io::Result<Box<dyn Write + Send>>;
+    fn clone_live_writer(&self) -> io::Result<RuntimeControlSubscriberStream>;
 }
 
 impl ControlStream for TcpStream {
@@ -594,9 +495,8 @@ impl ControlStream for TcpStream {
             .map(|stream| Box::new(BufReader::new(stream)) as Box<dyn BufRead>)
     }
 
-    fn clone_write(&self) -> io::Result<Box<dyn Write + Send>> {
-        self.try_clone()
-            .map(|stream| Box::new(stream) as Box<dyn Write + Send>)
+    fn clone_live_writer(&self) -> io::Result<RuntimeControlSubscriberStream> {
+        self.try_clone().map(RuntimeControlSubscriberStream::Tcp)
     }
 }
 
@@ -607,9 +507,8 @@ impl ControlStream for std::os::unix::net::UnixStream {
             .map(|stream| Box::new(BufReader::new(stream)) as Box<dyn BufRead>)
     }
 
-    fn clone_write(&self) -> io::Result<Box<dyn Write + Send>> {
-        self.try_clone()
-            .map(|stream| Box::new(stream) as Box<dyn Write + Send>)
+    fn clone_live_writer(&self) -> io::Result<RuntimeControlSubscriberStream> {
+        self.try_clone().map(RuntimeControlSubscriberStream::Unix)
     }
 }
 
@@ -726,7 +625,7 @@ pub(crate) fn register_control_live_stream_request<S: ControlStream>(
             runtime.register_control_log_subscriber(
                 level,
                 colorize,
-                stream.clone_write().map_err(control_io)?,
+                stream.clone_live_writer().map_err(control_io)?,
             )?;
             Ok(true)
         }
@@ -737,7 +636,7 @@ pub(crate) fn register_control_live_stream_request<S: ControlStream>(
                 .unwrap_or_default();
             runtime.register_control_pcap_subscriber(
                 snaplen,
-                stream.clone_write().map_err(control_io)?,
+                stream.clone_live_writer().map_err(control_io)?,
             )?;
             Ok(true)
         }
@@ -811,14 +710,8 @@ pub(crate) fn handle_control_stream_request_line_mut(
                 runtime.as_deref(),
             ))
         }),
-        REQ_PCAP => Some(ControlStreamResponse::stream(handle_control_pcap_request(
-            &fields,
-            runtime.as_deref(),
-        ))),
-        REQ_LOG => Some(ControlStreamResponse::stream(handle_control_log_request(
-            &fields,
-            runtime.as_deref(),
-        ))),
+        REQ_PCAP => Some(ControlStreamResponse::stream(Vec::new())),
+        REQ_LOG => Some(ControlStreamResponse::stream(Vec::new())),
         REQ_RELOAD => Some(ControlStreamResponse::text(handle_control_reload_request(
             config.as_deref_mut(),
             runtime.as_deref_mut(),
@@ -941,61 +834,6 @@ pub(crate) fn handle_control_set_debug_request(
     }
 
     Some(format!("{control} {REQ_SET_DEBUG} {old_level}\n"))
-}
-
-pub(crate) fn handle_control_log_request(
-    fields: &[&str],
-    runtime: Option<&RuntimeDaemonState>,
-) -> Vec<u8> {
-    let level = fields
-        .get(2)
-        .and_then(|value| value.parse::<i32>().ok())
-        .unwrap_or(-1);
-    let colorize = fields
-        .get(3)
-        .and_then(|value| value.parse::<i32>().ok())
-        .is_some_and(|value| value != 0);
-    let entries = runtime
-        .map(|runtime| runtime.control_log_entries(level, colorize))
-        .unwrap_or_default();
-
-    encode_control_payload_chunks(
-        REQ_LOG,
-        entries.iter().map(|entry| {
-            let bytes = entry.as_bytes();
-            &bytes[..bytes.len().min(LOG_CONTROL_BUFFER_SIZE)]
-        }),
-    )
-}
-
-pub(crate) fn handle_control_pcap_request(
-    fields: &[&str],
-    runtime: Option<&RuntimeDaemonState>,
-) -> Vec<u8> {
-    let snaplen = fields
-        .get(2)
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or_default();
-    let packets = runtime
-        .map(|runtime| runtime.control_pcap_packets(snaplen))
-        .unwrap_or_default();
-
-    encode_control_payload_chunks(REQ_PCAP, packets.iter().map(Vec::as_slice))
-}
-
-pub(crate) fn encode_control_payload_chunks<'a>(
-    request: i32,
-    chunks: impl IntoIterator<Item = &'a [u8]>,
-) -> Vec<u8> {
-    let control = Request::Control.number();
-    let mut output = Vec::new();
-
-    for chunk in chunks {
-        output.extend_from_slice(format!("{control} {request} {}\n", chunk.len()).as_bytes());
-        output.extend_from_slice(chunk);
-    }
-
-    output
 }
 
 pub(crate) fn runtime_state<'a>(
@@ -1154,6 +992,7 @@ pub(crate) fn dump_connections(runtime: Option<&RuntimeDaemonState>) -> String {
     );
 
     if let Some(runtime) = runtime {
+        output.push_str(&format_runtime_control_subscriber_connection_dump(runtime));
         output.push_str(&format_runtime_connection_dump(
             &runtime.meta_connection_infos(),
             runtime.hostnames,
@@ -1161,6 +1000,31 @@ pub(crate) fn dump_connections(runtime: Option<&RuntimeDaemonState>) -> String {
     }
 
     output.push_str(&format!("{control} {REQ_DUMP_CONNECTIONS}\n"));
+    output
+}
+
+pub(crate) fn format_runtime_control_subscriber_connection_dump(
+    runtime: &RuntimeDaemonState,
+) -> String {
+    let control = Request::Control.number();
+    let mut output = String::new();
+
+    for subscriber in &runtime.pcap_subscribers {
+        output.push_str(&format!(
+            "{control} {REQ_DUMP_CONNECTIONS} <control> localhost port unix 0 {} {:x}\n",
+            subscriber.writer.id,
+            CONNECTION_DUMP_STATUS_CONTROL | CONNECTION_DUMP_STATUS_PCAP
+        ));
+    }
+
+    for subscriber in &runtime.log_subscribers {
+        output.push_str(&format!(
+            "{control} {REQ_DUMP_CONNECTIONS} <control> localhost port unix 0 {} {:x}\n",
+            subscriber.writer.id,
+            CONNECTION_DUMP_STATUS_CONTROL | CONNECTION_DUMP_STATUS_LOG
+        ));
+    }
+
     output
 }
 
@@ -1228,7 +1092,9 @@ pub(crate) fn node_host_port(
         return (endpoint.address.clone(), endpoint.port.clone());
     }
 
-    if let Some(address) = config.addresses.address(&node.name) {
+    if runtime_local_port.is_none()
+        && let Some(address) = config.addresses.address(&node.name)
+    {
         return format_socket_addr_for_dump(address, hostnames);
     }
 

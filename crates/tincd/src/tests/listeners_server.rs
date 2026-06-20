@@ -73,6 +73,7 @@ fn runtime_listeners_bind_tcp_and_udp_from_daemon_config() {
 
     let mut runtime = RuntimeDaemonState::new(sockets, &config, keys);
     runtime.poll_once().unwrap();
+    runtime.flush_meta_outputs().unwrap();
     let connections = runtime.meta_connection_infos();
 
     assert_eq!(1, connections.len());
@@ -145,7 +146,7 @@ fn runtime_listener_rejects_address_family_mismatch() {
 #[test]
 fn systemd_listen_fd_is_reused_and_gets_matching_udp_socket_like_tincd() {
     tinc_test_support::assert_can_create_netns();
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let listener = bind_systemd_test_tcp_listener(1);
     let address = listener.local_addr().unwrap();
     let fd = unsafe { libc::fcntl(listener.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 64) };
     assert!(fd >= 0, "failed to duplicate listener fd");

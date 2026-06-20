@@ -57,10 +57,14 @@ fn runtime_key_expire_broadcasts_key_changed_and_forces_sptps_kex_like_tinc() {
         outbound_offset: 0,
         status: CONNECTION_STATUS_ACTIVE,
         options: (PROT_MINOR as u32) << 24,
+        outgoing_peer: None,
         outgoing_autoconnect: false,
+        connecting: false,
         close_requested: false,
         last_activity: Instant::now(),
+        last_ping_time: Instant::now(),
         last_ping_sent: None,
+        edge_peer: None,
         exec_proxy: None,
         kind: RuntimeMetaConnectionKind::Active {
             driver: RuntimeMetaDriver::modern(alpha_driver),
@@ -71,6 +75,7 @@ fn runtime_key_expire_broadcasts_key_changed_and_forces_sptps_kex_like_tinc() {
     runtime.next_key_expire = Some(Instant::now() - StdDuration::from_secs(1));
 
     runtime.expire_symmetric_keys().unwrap();
+    runtime.flush_meta_outputs().unwrap();
 
     assert!(
         !runtime
@@ -137,6 +142,7 @@ fn runtime_key_expire_sends_legacy_ans_key_to_direct_non_sptps_peer_like_tinc() 
     runtime.next_key_expire = Some(Instant::now() - StdDuration::from_secs(1));
 
     runtime.expire_symmetric_keys().unwrap();
+    runtime.flush_meta_outputs().unwrap();
 
     assert!(
         !runtime
@@ -275,15 +281,20 @@ fn runtime_tunnel_server_applies_but_does_not_forward_key_changed_like_tinc() {
         "C key_changed_h() resets last_req_key so the next legacy send can request a fresh key"
     );
 
-    let events = read_meta_events_until(&mut gamma_stream, &mut gamma_driver, |event| {
-        matches!(
-            event,
-            MetaConnectionEvent::Message(MetaMessage::KeyChanged(KeyChangedMessage {
-                origin,
-                ..
-            })) if origin == "beta"
-        )
-    });
+    let events = flush_then_read_meta_events_until(
+        &mut runtime,
+        &mut gamma_stream,
+        &mut gamma_driver,
+        |event| {
+            matches!(
+                event,
+                MetaConnectionEvent::Message(MetaMessage::KeyChanged(KeyChangedMessage {
+                    origin,
+                    ..
+                })) if origin == "beta"
+            )
+        },
+    );
     assert!(
         !events.iter().any(|event| matches!(
             event,
@@ -382,13 +393,18 @@ fn runtime_tunnel_server_drops_transit_ans_key_like_tinc() {
             .is_none(),
         "C ans_key_h() returns before applying a transit ANS_KEY reflexive UDP address on a tunnel server"
     );
-    let events = read_meta_events_until(&mut gamma_stream, &mut gamma_driver, |event| {
-        matches!(
-            event,
-            MetaConnectionEvent::Message(MetaMessage::AnswerKey(forwarded))
-                if forwarded.from == "beta" && forwarded.to == "gamma"
-        )
-    });
+    let events = flush_then_read_meta_events_until(
+        &mut runtime,
+        &mut gamma_stream,
+        &mut gamma_driver,
+        |event| {
+            matches!(
+                event,
+                MetaConnectionEvent::Message(MetaMessage::AnswerKey(forwarded))
+                    if forwarded.from == "beta" && forwarded.to == "gamma"
+            )
+        },
+    );
     assert!(
         !events.iter().any(|event| matches!(
             event,
@@ -438,10 +454,42 @@ fn runtime_key_expire_timer_includes_tinc_jitter() {
     );
 
     assert_eq!(
-        Some(base),
+        None,
         schedule_next_key_expire(base, -1),
-        "negative KeyExpire remains immediately due so it fires once like C"
+        "negative KeyExpire does not schedule a keyexpire timeout in C"
     );
+}
+
+#[test]
+fn runtime_past_request_cache_ages_on_tinc_timer() {
+    tinc_test_support::assert_can_create_netns();
+    let config =
+        RuntimeConfig::from_config_tree(&config_tree(&[("Name", "alpha"), ("PingInterval", "1")]))
+            .unwrap();
+    let keys = RuntimeKeys {
+        private_key: Some(test_key(1)),
+        peer_public_keys: BTreeMap::new(),
+        rsa_private_key: None,
+        peer_rsa_public_keys: BTreeMap::new(),
+    };
+    let mut runtime = RuntimeDaemonState::new(Vec::new(), &config, keys);
+    let message = parse_meta_message("10 123 beta 10.2.0.0/16").unwrap();
+
+    assert!(!runtime.mark_seen_runtime_message(&message));
+    assert_eq!(1, runtime.past_requests.len());
+    let next_age = runtime
+        .next_past_request_age
+        .expect("C schedules age_past_requests after first seen_request insert");
+    let delay = next_age.saturating_duration_since(Instant::now());
+    assert!(
+        delay < TINC_AGING_INTERVAL + StdDuration::from_micros(TINC_TIMER_JITTER_US as u64),
+        "C age_past_requests timer uses 10 seconds plus jitter()"
+    );
+
+    runtime.next_past_request_age = Some(Instant::now() - StdDuration::from_secs(1));
+    runtime.age_past_requests_at_like_tinc(Instant::now(), current_unix_secs().max(0) as u64 + 2);
+    assert!(runtime.past_requests.is_empty());
+    assert_eq!(None, runtime.next_past_request_age);
 }
 
 #[test]
@@ -910,6 +958,8 @@ fn runtime_answers_extended_req_pubkey_like_tinc() {
     let wire = beta_driver.send_meta_message(&request).unwrap();
     beta_stream.write_all(&wire).unwrap();
     runtime.poll_once().unwrap();
+    runtime.flush_meta_outputs().unwrap();
+    runtime.flush_meta_outputs().unwrap();
 
     let mut events = Vec::new();
     let mut buffer = [0u8; 4096];
@@ -1032,6 +1082,7 @@ fn runtime_forwards_sptps_req_key_to_target_next_hop_like_tinc() {
     let wire = beta_driver.send_meta_message(&request).unwrap();
     beta_stream.write_all(&wire).unwrap();
     runtime.poll_once().unwrap();
+    runtime.flush_meta_outputs().unwrap();
 
     let mut events = Vec::new();
     let mut buffer = [0u8; 4096];
@@ -1124,13 +1175,18 @@ fn runtime_relayed_sptps_req_key_sends_udp_info_like_tinc() {
         )
         .unwrap();
 
-    let events = read_meta_events_until(&mut gamma_stream, &mut gamma_driver, |event| {
-        matches!(
-            event,
-            MetaConnectionEvent::Message(MetaMessage::RequestKey(forwarded))
-                if forwarded == &request
-        )
-    });
+    let events = flush_then_read_meta_events_until(
+        &mut runtime,
+        &mut gamma_stream,
+        &mut gamma_driver,
+        |event| {
+            matches!(
+                event,
+                MetaConnectionEvent::Message(MetaMessage::RequestKey(forwarded))
+                    if forwarded == &request
+            )
+        },
+    );
 
     assert!(
         events.iter().any(|event| matches!(
@@ -1156,9 +1212,12 @@ fn runtime_sptps_req_key_waits_and_restarts_after_ten_seconds_like_tinc() {
         return;
     };
 
-    let first_events = read_meta_events_until(&mut beta_stream, &mut beta_driver, |event| {
-        is_sptps_initial_req_key(event, "alpha", "beta")
-    });
+    let first_events = flush_then_read_meta_events_until(
+        &mut runtime,
+        &mut beta_stream,
+        &mut beta_driver,
+        |event| is_sptps_initial_req_key(event, "alpha", "beta"),
+    );
     assert!(
         first_events
             .iter()
@@ -1183,7 +1242,7 @@ fn runtime_sptps_req_key_waits_and_restarts_after_ten_seconds_like_tinc() {
             .is_some()
     );
 
-    let first_written = runtime.meta_connections[0].bytes_written;
+    let first_pending = runtime.meta_connections[0].pending_output_len();
     let action = RuntimeSptpsKeyAction {
         peer: "beta".to_owned(),
         next_hop: "beta".to_owned(),
@@ -1191,18 +1250,24 @@ fn runtime_sptps_req_key_waits_and_restarts_after_ten_seconds_like_tinc() {
     runtime
         .handle_sptps_key_actions(vec![action.clone()])
         .unwrap();
-    assert_eq!(first_written, runtime.meta_connections[0].bytes_written);
+    assert_eq!(
+        first_pending,
+        runtime.meta_connections[0].pending_output_len()
+    );
 
     runtime.sptps_last_req_key.insert(
         "beta".to_owned(),
         Instant::now() - SPTPS_REQ_KEY_INTERVAL - StdDuration::from_secs(1),
     );
     runtime.handle_sptps_key_actions(vec![action]).unwrap();
-    assert!(runtime.meta_connections[0].bytes_written > first_written);
+    assert!(runtime.meta_connections[0].pending_output_len() > first_pending);
 
-    let restarted_events = read_meta_events_until(&mut beta_stream, &mut beta_driver, |event| {
-        is_sptps_initial_req_key(event, "alpha", "beta")
-    });
+    let restarted_events = flush_then_read_meta_events_until(
+        &mut runtime,
+        &mut beta_stream,
+        &mut beta_driver,
+        |event| is_sptps_initial_req_key(event, "alpha", "beta"),
+    );
     assert!(
         restarted_events
             .iter()
@@ -1229,6 +1294,83 @@ fn runtime_sptps_req_key_waits_and_restarts_after_ten_seconds_like_tinc() {
 }
 
 #[test]
+fn runtime_sptps_req_key_clears_stale_pending_when_not_waiting_like_tinc() {
+    tinc_test_support::assert_can_create_netns();
+    let Some((mut runtime, mut beta_stream, mut beta_driver)) =
+        active_sptps_runtime_waiting_for_beta_key()
+    else {
+        return;
+    };
+
+    let first_events = flush_then_read_meta_events_until(
+        &mut runtime,
+        &mut beta_stream,
+        &mut beta_driver,
+        |event| is_sptps_initial_req_key(event, "alpha", "beta"),
+    );
+    assert!(
+        first_events
+            .iter()
+            .any(|event| is_sptps_initial_req_key(event, "alpha", "beta"))
+    );
+    assert!(
+        runtime
+            .key_exchange
+            .as_ref()
+            .unwrap()
+            .pending_session("beta")
+            .is_some()
+    );
+    assert!(runtime.sptps_last_req_key.contains_key("beta"));
+
+    runtime
+        .state
+        .graph
+        .node_mut("beta")
+        .unwrap()
+        .status
+        .waiting_for_key = false;
+    let first_pending = runtime.meta_connections[0].pending_output_len();
+    runtime
+        .handle_sptps_key_actions(vec![RuntimeSptpsKeyAction {
+            peer: "beta".to_owned(),
+            next_hop: "beta".to_owned(),
+        }])
+        .unwrap();
+
+    assert!(runtime.meta_connections[0].pending_output_len() > first_pending);
+    let restarted_events = flush_then_read_meta_events_until(
+        &mut runtime,
+        &mut beta_stream,
+        &mut beta_driver,
+        |event| is_sptps_initial_req_key(event, "alpha", "beta"),
+    );
+    assert!(
+        restarted_events
+            .iter()
+            .any(|event| is_sptps_initial_req_key(event, "alpha", "beta")),
+        "C send_req_key() restarts SPTPS when waitingforkey is false, even if an old pending session exists"
+    );
+    assert!(
+        runtime
+            .state
+            .graph
+            .node("beta")
+            .unwrap()
+            .status
+            .waiting_for_key
+    );
+    assert!(
+        runtime
+            .key_exchange
+            .as_ref()
+            .unwrap()
+            .pending_session("beta")
+            .is_some()
+    );
+}
+
+#[test]
 fn runtime_bad_sptps_ans_key_from_meta_waits_before_restart_like_tinc() {
     tinc_test_support::assert_can_create_netns();
     let Some((mut runtime, _beta_stream, _beta_driver)) =
@@ -1236,7 +1378,7 @@ fn runtime_bad_sptps_ans_key_from_meta_waits_before_restart_like_tinc() {
     else {
         return;
     };
-    let first_written = runtime.meta_connections[0].bytes_written;
+    let first_pending = runtime.meta_connections[0].pending_output_len();
 
     let bad_answer = AnswerKeyMessage::sptps_handshake("beta", "alpha", b"not-a-record", 0);
     runtime
@@ -1253,7 +1395,8 @@ fn runtime_bad_sptps_ans_key_from_meta_waits_before_restart_like_tinc() {
 
     assert_eq!(1, runtime.meta_connections.len());
     assert_eq!(
-        first_written, runtime.meta_connections[0].bytes_written,
+        first_pending,
+        runtime.meta_connections[0].pending_output_len(),
         "C ans_key_h() returns true for bad SPTPS ANS_KEY without restarting inside 10s"
     );
     let beta = runtime.state.graph.node("beta").unwrap();
@@ -1278,7 +1421,7 @@ fn runtime_bad_sptps_ans_key_from_meta_restarts_after_ten_seconds_like_tinc() {
     else {
         return;
     };
-    let first_written = runtime.meta_connections[0].bytes_written;
+    let first_pending = runtime.meta_connections[0].pending_output_len();
     runtime.sptps_last_req_key.insert(
         "beta".to_owned(),
         Instant::now() - SPTPS_REQ_KEY_INTERVAL - StdDuration::from_secs(1),
@@ -1297,10 +1440,13 @@ fn runtime_bad_sptps_ans_key_from_meta_restarts_after_ten_seconds_like_tinc() {
         )
         .unwrap();
 
-    assert!(runtime.meta_connections[0].bytes_written > first_written);
-    let restarted_events = read_meta_events_until(&mut beta_stream, &mut beta_driver, |event| {
-        is_sptps_initial_req_key(event, "alpha", "beta")
-    });
+    assert!(runtime.meta_connections[0].pending_output_len() > first_pending);
+    let restarted_events = flush_then_read_meta_events_until(
+        &mut runtime,
+        &mut beta_stream,
+        &mut beta_driver,
+        |event| is_sptps_initial_req_key(event, "alpha", "beta"),
+    );
     assert!(
         restarted_events
             .iter()
@@ -1396,15 +1542,20 @@ fn runtime_sptps_ans_key_applies_reflexive_address_and_sends_mtu_info_like_tinc(
         )
         .unwrap();
 
-    let first_events = read_meta_events_until(&mut gamma_stream, &mut gamma_driver, |event| {
-        matches!(
-            event,
-            MetaConnectionEvent::Message(MetaMessage::AnswerKey(answer))
-                if answer.from == "alpha"
-                    && answer.to == "beta"
-                    && answer.is_sptps_handshake()
-        )
-    });
+    let first_events = flush_then_read_meta_events_until(
+        &mut runtime,
+        &mut gamma_stream,
+        &mut gamma_driver,
+        |event| {
+            matches!(
+                event,
+                MetaConnectionEvent::Message(MetaMessage::AnswerKey(answer))
+                    if answer.from == "alpha"
+                        && answer.to == "beta"
+                        && answer.is_sptps_handshake()
+            )
+        },
+    );
     let alpha_answer = first_events
         .iter()
         .find_map(|event| match event {
@@ -1540,21 +1691,26 @@ fn runtime_sptps_req_key_success_sends_mtu_info_like_tinc() {
         "C req_key_ext_h() sets waitingforkey while responder SPTPS is pending"
     );
 
-    let events = read_meta_events_until(&mut gamma_stream, &mut gamma_driver, |event| {
-        matches!(
-            event,
-            MetaConnectionEvent::Message(MetaMessage::AnswerKey(answer))
-                if answer.from == "alpha"
-                    && answer.to == "beta"
-                    && answer.is_sptps_handshake()
-        ) || matches!(
-            event,
-            MetaConnectionEvent::Message(MetaMessage::MtuInfo(message))
-                if message.from == "alpha"
-                    && message.to == "beta"
-                    && message.mtu == DEFAULT_MTU
-        )
-    });
+    let events = flush_then_read_meta_events_until(
+        &mut runtime,
+        &mut gamma_stream,
+        &mut gamma_driver,
+        |event| {
+            matches!(
+                event,
+                MetaConnectionEvent::Message(MetaMessage::AnswerKey(answer))
+                    if answer.from == "alpha"
+                        && answer.to == "beta"
+                        && answer.is_sptps_handshake()
+            ) || matches!(
+                event,
+                MetaConnectionEvent::Message(MetaMessage::MtuInfo(message))
+                    if message.from == "alpha"
+                        && message.to == "beta"
+                        && message.mtu == DEFAULT_MTU
+            )
+        },
+    );
 
     assert!(
         events.iter().any(|event| matches!(
@@ -1586,7 +1742,7 @@ fn runtime_bad_sptps_req_key_start_from_meta_does_not_fail_daemon_like_tinc() {
     else {
         return;
     };
-    let first_written = runtime.meta_connections[0].bytes_written;
+    let first_pending = runtime.meta_connections[0].pending_output_len();
     let request = RequestKeyMessage {
         from: "beta".to_owned(),
         to: "alpha".to_owned(),
@@ -1610,7 +1766,8 @@ fn runtime_bad_sptps_req_key_start_from_meta_does_not_fail_daemon_like_tinc() {
 
     assert_eq!(1, runtime.meta_connections.len());
     assert_eq!(
-        first_written, runtime.meta_connections[0].bytes_written,
+        first_pending,
+        runtime.meta_connections[0].pending_output_len(),
         "C req_key_ext_h() returns true for invalid REQ_SPTPS_START data"
     );
     let beta = runtime.state.graph.node("beta").unwrap();
@@ -1626,7 +1783,7 @@ fn runtime_bad_sptps_packet_from_meta_waits_before_restart_like_tinc() {
     else {
         return;
     };
-    let first_written = runtime.meta_connections[0].bytes_written;
+    let first_pending = runtime.meta_connections[0].pending_output_len();
     let request = RequestKeyMessage::sptps_tcp_packet("beta", "alpha", b"not-a-record");
 
     runtime
@@ -1643,7 +1800,8 @@ fn runtime_bad_sptps_packet_from_meta_waits_before_restart_like_tinc() {
 
     assert_eq!(1, runtime.meta_connections.len());
     assert_eq!(
-        first_written, runtime.meta_connections[0].bytes_written,
+        first_pending,
+        runtime.meta_connections[0].pending_output_len(),
         "C req_key_ext_h() returns true for bad SPTPS_PACKET without restarting inside 10s"
     );
     let beta = runtime.state.graph.node("beta").unwrap();
@@ -1659,7 +1817,7 @@ fn runtime_bad_sptps_packet_from_meta_restarts_after_ten_seconds_like_tinc() {
     else {
         return;
     };
-    let first_written = runtime.meta_connections[0].bytes_written;
+    let first_pending = runtime.meta_connections[0].pending_output_len();
     runtime.sptps_last_req_key.insert(
         "beta".to_owned(),
         Instant::now() - SPTPS_REQ_KEY_INTERVAL - StdDuration::from_secs(1),
@@ -1678,10 +1836,13 @@ fn runtime_bad_sptps_packet_from_meta_restarts_after_ten_seconds_like_tinc() {
         )
         .unwrap();
 
-    assert!(runtime.meta_connections[0].bytes_written > first_written);
-    let restarted_events = read_meta_events_until(&mut beta_stream, &mut beta_driver, |event| {
-        is_sptps_initial_req_key(event, "alpha", "beta")
-    });
+    assert!(runtime.meta_connections[0].pending_output_len() > first_pending);
+    let restarted_events = flush_then_read_meta_events_until(
+        &mut runtime,
+        &mut beta_stream,
+        &mut beta_driver,
+        |event| is_sptps_initial_req_key(event, "alpha", "beta"),
+    );
     assert!(
         restarted_events
             .iter()
@@ -1726,18 +1887,23 @@ fn runtime_sptps_missing_peer_ed25519_requests_pubkey_like_tinc() {
         }])
         .unwrap();
 
-    let events = read_meta_events_until(&mut beta_stream, &mut beta_driver, |event| {
-        matches!(
-            event,
-            MetaConnectionEvent::Message(MetaMessage::RequestKey(request))
-                if request.from == "alpha"
-                    && request.to == "beta"
-                    && request.extension.as_ref().is_some_and(|extension| {
-                        extension.request == Request::RequestPublicKey.number()
-                            && extension.payload.is_none()
-                    })
-        )
-    });
+    let events = flush_then_read_meta_events_until(
+        &mut runtime,
+        &mut beta_stream,
+        &mut beta_driver,
+        |event| {
+            matches!(
+                event,
+                MetaConnectionEvent::Message(MetaMessage::RequestKey(request))
+                    if request.from == "alpha"
+                        && request.to == "beta"
+                        && request.extension.as_ref().is_some_and(|extension| {
+                            extension.request == Request::RequestPublicKey.number()
+                                && extension.payload.is_none()
+                        })
+            )
+        },
+    );
     assert!(events.iter().any(|event| {
         matches!(
             event,
@@ -1852,18 +2018,23 @@ fn runtime_starts_sptps_after_learning_ans_pubkey_like_tinc() {
             next_hop: "beta".to_owned(),
         }])
         .unwrap();
-    let pubkey_events = read_meta_events_until(&mut beta_stream, &mut beta_driver, |event| {
-        matches!(
-            event,
-            MetaConnectionEvent::Message(MetaMessage::RequestKey(request))
-                if request.from == "alpha"
-                    && request.to == "beta"
-                    && request.extension.as_ref().is_some_and(|extension| {
-                        extension.request == Request::RequestPublicKey.number()
-                            && extension.payload.is_none()
-                    })
-        )
-    });
+    let pubkey_events = flush_then_read_meta_events_until(
+        &mut runtime,
+        &mut beta_stream,
+        &mut beta_driver,
+        |event| {
+            matches!(
+                event,
+                MetaConnectionEvent::Message(MetaMessage::RequestKey(request))
+                    if request.from == "alpha"
+                        && request.to == "beta"
+                        && request.extension.as_ref().is_some_and(|extension| {
+                            extension.request == Request::RequestPublicKey.number()
+                                && extension.payload.is_none()
+                        })
+            )
+        },
+    );
     assert!(pubkey_events.iter().any(|event| {
         matches!(
             event,
@@ -1895,9 +2066,12 @@ fn runtime_starts_sptps_after_learning_ans_pubkey_like_tinc() {
             next_hop: "beta".to_owned(),
         }])
         .unwrap();
-    let sptps_events = read_meta_events_until(&mut beta_stream, &mut beta_driver, |event| {
-        is_sptps_initial_req_key(event, "alpha", "beta")
-    });
+    let sptps_events = flush_then_read_meta_events_until(
+        &mut runtime,
+        &mut beta_stream,
+        &mut beta_driver,
+        |event| is_sptps_initial_req_key(event, "alpha", "beta"),
+    );
     assert!(
         sptps_events
             .iter()
@@ -2013,6 +2187,7 @@ Ed25519PublicKey = {}\n",
         )
         .unwrap();
     runtime.poll_once().unwrap();
+    runtime.flush_meta_outputs().unwrap();
 
     let mut buffer = Vec::new();
     let id_line = read_test_tcp_line(&mut client, &mut buffer);
@@ -2038,7 +2213,7 @@ Ed25519PublicKey = {}\n",
     )
     .unwrap();
     let mut decoder = MetaStreamDecoder::new();
-    decoder.push(&std::mem::take(&mut buffer));
+    decoder.push(&std::mem::take(&mut buffer)).unwrap();
 
     for record in session.drain_outbound() {
         client.write_all(&record).unwrap();
@@ -2063,8 +2238,9 @@ Ed25519PublicKey = {}\n",
 
         thread::sleep(StdDuration::from_millis(25));
         runtime.poll_once().unwrap();
+        runtime.flush_meta_outputs().unwrap();
         read_test_tcp_available(&mut client, &mut buffer);
-        decoder.push(&std::mem::take(&mut buffer));
+        decoder.push(&std::mem::take(&mut buffer)).unwrap();
         accepted = process_invitation_client_frames(
             &mut session,
             &mut decoder,
@@ -2196,10 +2372,14 @@ fn runtime_legacy_authentication_times_out_at_ping_timeout_like_tinc() {
         outbound_offset: 0,
         status: CONNECTION_STATUS_ACTIVE,
         options: 0,
+        outgoing_peer: None,
         outgoing_autoconnect: false,
+        connecting: false,
         close_requested: false,
         last_activity: Instant::now() - runtime.ping_timeout,
+        last_ping_time: Instant::now() - runtime.ping_timeout,
         last_ping_sent: None,
+        edge_peer: None,
         exec_proxy: None,
         kind: RuntimeMetaConnectionKind::Active {
             driver,
@@ -2308,6 +2488,7 @@ fn runtime_sends_plain_legacy_ans_key_to_source_next_hop_like_tinc() {
     let wire = beta_driver.send_meta_message(&request).unwrap();
     beta_stream.write_all(&wire).unwrap();
     alpha.poll_once().unwrap();
+    alpha.flush_meta_outputs().unwrap();
 
     let mut buffer = [0u8; 1024];
     let len = beta_stream.read(&mut buffer).unwrap();
@@ -2362,6 +2543,7 @@ fn runtime_legacy_missing_outgoing_key_falls_back_to_tcp_and_requests_key_like_t
         .push_device_packet(VpnPacket::new(packet.clone()).unwrap())
         .unwrap();
     alpha.poll_once().unwrap();
+    alpha.flush_meta_outputs().unwrap();
 
     let mut events = Vec::new();
     let mut buffer = [0u8; 4096];
@@ -2428,6 +2610,7 @@ fn runtime_legacy_missing_outgoing_key_falls_back_to_tcp_and_requests_key_like_t
         .push_device_packet(VpnPacket::new(packet.clone()).unwrap())
         .unwrap();
     alpha.poll_once().unwrap();
+    alpha.flush_meta_outputs().unwrap();
     let len = beta_stream.read(&mut buffer).unwrap();
     let step = beta_driver.receive_bytes(&buffer[..len]).unwrap();
 
@@ -2461,6 +2644,7 @@ fn runtime_legacy_missing_outgoing_key_falls_back_to_tcp_and_requests_key_like_t
         .push_device_packet(VpnPacket::new(packet.clone()).unwrap())
         .unwrap();
     alpha.poll_once().unwrap();
+    alpha.flush_meta_outputs().unwrap();
 
     let mut repeated_events = Vec::new();
     let deadline = Instant::now() + StdDuration::from_secs(1);
@@ -2499,16 +2683,30 @@ fn runtime_legacy_missing_outgoing_key_falls_back_to_tcp_and_requests_key_like_t
 }
 
 #[test]
-fn runtime_legacy_peer_without_inbound_key_falls_back_to_tcp_and_answers_key_like_tinc() {
+fn runtime_legacy_peer_without_inbound_key_sends_udp_and_answers_key_like_tinc() {
     tinc_test_support::assert_can_create_netns();
+    let alpha_socket = match test_runtime_listen_socket() {
+        Ok(socket) => socket,
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return,
+        Err(error) => panic!("failed to bind alpha legacy listener: {error}"),
+    };
+    let beta_receiver = match UdpSocket::bind("127.0.0.1:0") {
+        Ok(socket) => socket,
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return,
+        Err(error) => panic!("failed to bind beta UDP receiver: {error}"),
+    };
+    beta_receiver.set_nonblocking(true).unwrap();
+    let beta_addr = beta_receiver.local_addr().unwrap();
+    let beta_address = format!("{} {}", beta_addr.ip(), beta_addr.port());
     let alpha_key = test_key(1);
     let beta_key = test_key(2);
     let server = config_tree(&[
         ("Name", "alpha"),
+        ("AddressFamily", "IPv4"),
         ("ExperimentalProtocol", "no"),
         ("StrictSubnets", "yes"),
     ]);
-    let beta_host = config_tree(&[("Subnet", "10.2.0.0/16")]);
+    let beta_host = config_tree(&[("Address", &beta_address), ("Subnet", "10.2.0.0/16")]);
     let config =
         RuntimeConfig::from_config_tree_with_hosts(&server, [("beta", &beta_host)]).unwrap();
     let keys = RuntimeKeys {
@@ -2522,7 +2720,7 @@ fn runtime_legacy_peer_without_inbound_key_falls_back_to_tcp_and_answers_key_lik
     else {
         return;
     };
-    let mut alpha = RuntimeDaemonState::new(Vec::new(), &config, keys);
+    let mut alpha = RuntimeDaemonState::new(vec![alpha_socket], &config, keys);
     beta_connection.id = 1;
     alpha.meta_connections.push(beta_connection);
     {
@@ -2557,19 +2755,46 @@ fn runtime_legacy_peer_without_inbound_key_falls_back_to_tcp_and_answers_key_lik
         .unwrap();
     alpha.poll_once().unwrap();
 
-    let events = read_meta_events_until(&mut beta_stream, &mut beta_driver, |event| {
-        matches!(event, MetaConnectionEvent::TcpPacket(payload) if payload == &packet)
-            || matches!(
+    let mut buffer = [0u8; 2048];
+    let udp_len = {
+        let deadline = Instant::now() + StdDuration::from_secs(1);
+        loop {
+            match beta_receiver.recv_from(&mut buffer) {
+                Ok((len, _)) => break len,
+                Err(error)
+                    if error.kind() == io::ErrorKind::WouldBlock && Instant::now() < deadline =>
+                {
+                    thread::sleep(StdDuration::from_millis(10));
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    panic!("timed out waiting for legacy UDP packet")
+                }
+                Err(error) => panic!("failed to receive legacy UDP packet: {error}"),
+            }
+        }
+    };
+    assert!(
+        udp_len > 0,
+        "C send_udppacket() only requires validkey for legacy UDP transmission"
+    );
+
+    let events = flush_then_read_meta_events_until(
+        &mut alpha,
+        &mut beta_stream,
+        &mut beta_driver,
+        |event| {
+            matches!(
                 event,
                 MetaConnectionEvent::Message(MetaMessage::AnswerKey(answer))
                     if answer.from == "alpha" && answer.to == "beta"
             )
-    });
+        },
+    );
     assert!(
-        events.iter().any(
+        !events.iter().any(
             |event| matches!(event, MetaConnectionEvent::TcpPacket(payload) if payload == &packet)
         ),
-        "when the peer does not have our legacy key yet, data must use meta TCP instead of an immediately dropped UDP packet"
+        "C send_udppacket() does not fall back to meta TCP just because validkey_in is false"
     );
     assert!(
         events.iter().any(|event| matches!(
@@ -2577,7 +2802,7 @@ fn runtime_legacy_peer_without_inbound_key_falls_back_to_tcp_and_answers_key_lik
             MetaConnectionEvent::Message(MetaMessage::AnswerKey(answer))
                 if answer.from == "alpha" && answer.to == "beta" && !answer.is_sptps_handshake()
         )),
-        "legacy TCP fallback must also send ANS_KEY so the peer can accept later UDP packets"
+        "C try_tx_legacy() sends ANS_KEY after the UDP send so the peer can accept later packets"
     );
     assert!(alpha.state.graph.node("beta").unwrap().status.valid_key_in);
     assert!(!alpha.legacy_last_req_key.contains_key("beta"));
@@ -2665,7 +2890,8 @@ fn runtime_bad_legacy_ans_key_clears_old_outgoing_key_like_tinc() {
         .push_device_packet(VpnPacket::new(packet.clone()).unwrap())
         .unwrap();
     alpha.poll_once().unwrap();
-    let events = read_meta_events_until(
+    let events = flush_then_read_meta_events_until(
+        &mut alpha,
         &mut beta_stream,
         &mut beta_driver,
         |event| matches!(event, MetaConnectionEvent::TcpPacket(payload) if payload == &packet),
@@ -2899,6 +3125,7 @@ fn runtime_forwards_legacy_ans_key_with_reflexive_address_like_tinc() {
         address: None,
     };
     runtime.forward_answer_key_message(&answer).unwrap();
+    runtime.flush_meta_outputs().unwrap();
 
     let mut buffer = [0u8; 512];
     let len = gamma_stream.read(&mut buffer).unwrap();
@@ -2966,10 +3193,14 @@ fn runtime_replies_to_meta_ping_with_pong() {
         outbound_offset: 0,
         status: CONNECTION_STATUS_ACTIVE,
         options: (PROT_MINOR as u32) << 24,
+        outgoing_peer: None,
         outgoing_autoconnect: false,
+        connecting: false,
         close_requested: false,
         last_activity: Instant::now(),
+        last_ping_time: Instant::now(),
         last_ping_sent: None,
+        edge_peer: None,
         exec_proxy: None,
         kind: RuntimeMetaConnectionKind::Active {
             driver: RuntimeMetaDriver::modern(alpha_driver),
@@ -2981,6 +3212,7 @@ fn runtime_replies_to_meta_ping_with_pong() {
     let ping = beta_driver.send_meta_message(&MetaMessage::Ping).unwrap();
     remote_stream.write_all(&ping).unwrap();
     runtime.poll_once().unwrap();
+    runtime.flush_meta_outputs().unwrap();
 
     let mut buffer = [0u8; 512];
     let len = remote_stream.read(&mut buffer).unwrap();
@@ -3053,8 +3285,25 @@ fn runtime_random_early_drops_tcp_packets_when_meta_outbuf_is_large_like_tinc() 
 }
 
 #[test]
+fn runtime_tcp_fallback_queues_meta_output_until_io_write_like_tinc() {
+    tinc_test_support::assert_can_create_netns();
+    let alpha_key = test_key(1);
+    let beta_key = test_key(2);
+    let Some((_beta_stream, _beta_driver, mut beta_connection)) =
+        active_runtime_connection("beta", alpha_key.clone(), beta_key.clone())
+    else {
+        return;
+    };
+
+    send_plain_tcp_packet_on_connection(&mut beta_connection, b"abcd", 10 * DEFAULT_MTU).unwrap();
+
+    assert!(!beta_connection.outbound.is_empty());
+    assert_eq!(0, beta_connection.bytes_written);
+}
+
+#[test]
 #[cfg(unix)]
-fn runtime_marks_meta_connection_closed_on_tcp_fallback_write_error_like_tinc() {
+fn runtime_tcp_fallback_write_error_is_deferred_until_meta_flush_like_tinc() {
     tinc_test_support::assert_can_create_netns();
     let alpha_key = test_key(1);
     let beta_key = test_key(2);
@@ -3084,30 +3333,18 @@ fn runtime_marks_meta_connection_closed_on_tcp_fallback_write_error_like_tinc() 
     );
     drop(beta_stream);
 
-    let mut marked = false;
-    for _ in 0..20 {
-        match send_sptps_tcp_packet_on_connection(
-            &mut beta_connection,
-            b"packet over stale meta connection",
-            usize::MAX,
-        ) {
-            Ok(()) => {}
-            Err(error) => {
-                marked = mark_meta_connection_closed_on_scoped_error_like_tinc(
-                    &mut beta_connection,
-                    error,
-                )
-                .unwrap();
-                break;
-            }
-        }
-        thread::sleep(StdDuration::from_millis(10));
-    }
+    send_sptps_tcp_packet_on_connection(
+        &mut beta_connection,
+        b"packet over stale meta connection",
+        usize::MAX,
+    )
+    .unwrap();
 
     assert!(
-        marked || beta_connection.close_requested,
-        "C handle_meta_write() closes stale meta connections on write errors instead of making data-plane TCP fallback fatal"
+        !beta_connection.close_requested,
+        "C send_tcppacket() only queues data; handle_meta_write() closes stale meta connections later"
     );
+    assert!(!beta_connection.outbound.is_empty());
 }
 
 #[test]
@@ -3227,10 +3464,14 @@ fn runtime_closes_meta_connection_on_terminate_request() {
         outbound_offset: 0,
         status: CONNECTION_STATUS_ACTIVE,
         options: (PROT_MINOR as u32) << 24,
+        outgoing_peer: None,
         outgoing_autoconnect: false,
+        connecting: false,
         close_requested: false,
         last_activity: Instant::now(),
+        last_ping_time: Instant::now(),
         last_ping_sent: None,
+        edge_peer: None,
         exec_proxy: None,
         kind: RuntimeMetaConnectionKind::Active {
             driver: RuntimeMetaDriver::modern(alpha_driver),
@@ -3299,10 +3540,14 @@ fn runtime_applies_meta_state_messages_to_control_dumps() {
         outbound_offset: 0,
         status: CONNECTION_STATUS_ACTIVE,
         options: (PROT_MINOR as u32) << 24,
+        outgoing_peer: None,
         outgoing_autoconnect: false,
+        connecting: false,
         close_requested: false,
         last_activity: Instant::now(),
+        last_ping_time: Instant::now(),
         last_ping_sent: None,
+        edge_peer: None,
         exec_proxy: None,
         kind: RuntimeMetaConnectionKind::Active {
             driver: RuntimeMetaDriver::modern(alpha_driver),
@@ -3332,6 +3577,57 @@ fn runtime_applies_meta_state_messages_to_control_dumps() {
     );
 
     fs::remove_dir_all(confbase).unwrap();
+}
+
+#[test]
+fn runtime_close_requested_waits_for_pending_meta_output_like_tinc() {
+    tinc_test_support::assert_can_create_netns();
+    let alpha_key = test_key(1);
+    let beta_key = test_key(2);
+    let config = RuntimeConfig::from_config_tree(&config_tree(&[("Name", "alpha")])).unwrap();
+    let keys = RuntimeKeys {
+        private_key: Some(alpha_key.clone()),
+        peer_public_keys: BTreeMap::from([("beta".to_owned(), beta_key.public_key())]),
+        rsa_private_key: None,
+        peer_rsa_public_keys: BTreeMap::new(),
+    };
+    let Some((mut beta_stream, mut beta_driver, mut beta_connection)) =
+        active_runtime_connection("beta", alpha_key, beta_key)
+    else {
+        return;
+    };
+    let mut runtime = RuntimeDaemonState::new(Vec::new(), &config, keys);
+    beta_connection.id = 1;
+    runtime.meta_connections.push(beta_connection);
+
+    let ping = beta_driver.send_meta_message(&MetaMessage::Ping).unwrap();
+    let termreq = beta_driver
+        .send_meta_message(&MetaMessage::TerminateRequest)
+        .unwrap();
+    beta_stream.write_all(&ping).unwrap();
+    beta_stream.write_all(&termreq).unwrap();
+    runtime.poll_once().unwrap();
+
+    assert_eq!(
+        1,
+        runtime.meta_connection_infos().len(),
+        "C keeps the connection until queued meta output has passed through IO_WRITE"
+    );
+
+    let events = flush_then_read_meta_events_until(
+        &mut runtime,
+        &mut beta_stream,
+        &mut beta_driver,
+        |event| matches!(event, MetaConnectionEvent::Message(MetaMessage::Pong)),
+    );
+
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, MetaConnectionEvent::Message(MetaMessage::Pong))),
+        "queued PONG must be written before the close requested by TERMREQ"
+    );
+    assert!(runtime.meta_connection_infos().is_empty());
 }
 
 #[test]
@@ -3383,6 +3679,7 @@ fn runtime_broadcasts_meta_state_messages_to_other_peers() {
     let add_subnet = beta_driver.send_meta_message(&message).unwrap();
     beta_stream.write_all(&add_subnet).unwrap();
     runtime.poll_once().unwrap();
+    runtime.flush_meta_outputs().unwrap();
 
     let mut buffer = [0u8; 512];
     let len = gamma_stream.read(&mut buffer).unwrap();
@@ -3468,6 +3765,7 @@ fn runtime_syncs_existing_subnets_when_meta_connection_activates() {
             },
         )
         .unwrap();
+    runtime.flush_meta_outputs().unwrap();
 
     let mut events = Vec::new();
     let mut buffer = [0u8; 512];
@@ -3505,6 +3803,12 @@ fn runtime_syncs_existing_subnets_when_meta_connection_activates() {
                         && message.address == "198.51.100.9"
                         && message.port == "655"
             )
+        }) && events.iter().any(|event| {
+            matches!(
+                event,
+                MetaConnectionEvent::Message(MetaMessage::AddEdge(message))
+                    if message.edge.from == "alpha" && message.edge.to == "beta"
+            )
         }) && events
             .iter()
             .any(|event| is_sptps_initial_req_key(event, "alpha", "beta"))
@@ -3530,6 +3834,11 @@ fn runtime_syncs_existing_subnets_when_meta_connection_activates() {
         event,
         MetaConnectionEvent::Message(MetaMessage::AddEdge(message))
             if message.edge.from == "beta" && message.edge.to == "alpha"
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        MetaConnectionEvent::Message(MetaMessage::AddEdge(message))
+            if message.edge.from == "alpha" && message.edge.to == "beta"
     )));
     let subnet_pos = events
         .iter()
@@ -3558,8 +3867,23 @@ fn runtime_syncs_existing_subnets_when_meta_connection_activates() {
         .iter()
         .position(|event| is_sptps_initial_req_key(event, "alpha", "beta"))
         .unwrap();
+    let new_edge_pos = events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                MetaConnectionEvent::Message(MetaMessage::AddEdge(message))
+                    if message.edge.from == "alpha" && message.edge.to == "beta"
+            )
+        })
+        .unwrap();
     assert!(subnet_pos < req_pos);
     assert!(edge_pos < req_pos);
+    assert!(new_edge_pos < req_pos);
+    assert!(
+        edge_pos < new_edge_pos,
+        "C ack_h() sends existing edges before creating and sending the new connection edge"
+    );
 
     fs::remove_dir_all(confbase).unwrap();
 }

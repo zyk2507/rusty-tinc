@@ -4,7 +4,7 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 
 use crate::graph::{DEFAULT_MTU, OPTION_CLAMP_MSS};
 use crate::state::NetworkState;
-use crate::subnet::{MacAddr, Subnet};
+use crate::subnet::{MacAddr, Subnet, SubnetKind};
 
 pub const ETH_HLEN: usize = 14;
 pub const ETH_P_IP: u16 = 0x0800;
@@ -524,7 +524,7 @@ pub fn arp_reply_packet(
         packet[arp_start + 26],
         packet[arp_start + 27],
     );
-    let Some(subnet) = state.subnets.lookup_ipv4(target) else {
+    let Some(subnet) = lookup_reachable_ipv4_subnet_like_tinc(state, target) else {
         return Err(RouteDropReason::UnknownArpTarget(target));
     };
 
@@ -607,7 +607,7 @@ pub fn neighbor_advertisement_packet(
         <[u8; 16]>::try_from(&packet[icmp_start + 8..icmp_start + 24])
             .expect("slice length checked by ND_NEIGHBOR_SOLICIT_LEN"),
     );
-    let Some(subnet) = state.subnets.lookup_ipv6(target) else {
+    let Some(subnet) = lookup_reachable_ipv6_subnet_like_tinc(state, target) else {
         return Err(RouteDropReason::UnknownNeighborTarget(target));
     };
 
@@ -1513,7 +1513,7 @@ fn route_ipv4(
     }
 
     let destination = Ipv4Addr::new(packet[30], packet[31], packet[32], packet[33]);
-    let Some(subnet) = state.subnets.lookup_ipv4(destination) else {
+    let Some(subnet) = lookup_reachable_ipv4_subnet_like_tinc(state, destination) else {
         return RouteOutcome::new(RouteDecision::Drop(
             RouteDropReason::UnknownIpv4Destination(destination),
         ));
@@ -1540,7 +1540,7 @@ fn route_ipv6(
     let destination = Ipv6Addr::from(
         <[u8; 16]>::try_from(&packet[38..54]).expect("slice length checked by IPV6_MIN_LEN"),
     );
-    let Some(subnet) = state.subnets.lookup_ipv6(destination) else {
+    let Some(subnet) = lookup_reachable_ipv6_subnet_like_tinc(state, destination) else {
         return RouteOutcome::new(RouteDecision::Drop(
             RouteDropReason::UnknownIpv6Destination(destination),
         ));
@@ -1575,7 +1575,7 @@ fn route_mac(
         }
     }
 
-    let Some(subnet) = state.subnets.lookup_mac(frame.destination) else {
+    let Some(subnet) = lookup_reachable_mac_subnet_like_tinc(state, frame.destination) else {
         return outcome;
     };
 
@@ -1613,6 +1613,55 @@ fn route_mac(
         via,
     };
     outcome
+}
+
+fn lookup_reachable_mac_subnet_like_tinc(
+    state: &NetworkState,
+    address: MacAddr,
+) -> Option<&Subnet> {
+    lookup_reachable_subnet_like_tinc(
+        state,
+        |subnet| matches!(subnet.kind, SubnetKind::Mac(mac) if mac == address),
+    )
+}
+
+fn lookup_reachable_ipv4_subnet_like_tinc(
+    state: &NetworkState,
+    address: Ipv4Addr,
+) -> Option<&Subnet> {
+    lookup_reachable_subnet_like_tinc(state, |subnet| subnet.matches_ipv4(address))
+}
+
+fn lookup_reachable_ipv6_subnet_like_tinc(
+    state: &NetworkState,
+    address: Ipv6Addr,
+) -> Option<&Subnet> {
+    lookup_reachable_subnet_like_tinc(state, |subnet| subnet.matches_ipv6(address))
+}
+
+fn lookup_reachable_subnet_like_tinc(
+    state: &NetworkState,
+    matches: impl Fn(&Subnet) -> bool,
+) -> Option<&Subnet> {
+    let mut result = None;
+
+    for subnet in state.subnets.iter() {
+        if !matches(subnet) {
+            continue;
+        }
+
+        result = Some(subnet);
+        if subnet.owner.as_deref().is_none_or(|owner| {
+            state
+                .graph
+                .node(owner)
+                .is_some_and(|node| node.status.reachable)
+        }) {
+            break;
+        }
+    }
+
+    result
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1907,6 +1956,36 @@ mod tests {
         state
     }
 
+    fn duplicate_subnet_state() -> NetworkState {
+        let mut state = NetworkState::new("myself");
+        state.graph.ensure_node("alpha");
+        state.graph.ensure_node("beta");
+        state
+            .graph
+            .connect_bidirectional("myself", "beta", 1)
+            .unwrap();
+        state.recompute_routes();
+        state
+            .apply_meta_message(parse_meta_message("10 1 alpha 10.9.0.0/24").unwrap())
+            .unwrap();
+        state
+            .apply_meta_message(parse_meta_message("10 2 beta 10.9.0.0/24").unwrap())
+            .unwrap();
+        state
+            .apply_meta_message(parse_meta_message("10 3 alpha 2001:db9::/32").unwrap())
+            .unwrap();
+        state
+            .apply_meta_message(parse_meta_message("10 4 beta 2001:db9::/32").unwrap())
+            .unwrap();
+        state
+            .apply_meta_message(parse_meta_message("10 5 alpha 02:00:00:00:00:09").unwrap())
+            .unwrap();
+        state
+            .apply_meta_message(parse_meta_message("10 6 beta 02:00:00:00:00:09").unwrap())
+            .unwrap();
+        state
+    }
+
     #[test]
     fn router_mode_routes_ipv4_to_subnet_owner() {
         tinc_test_support::assert_can_create_netns();
@@ -1928,6 +2007,26 @@ mod tests {
     }
 
     #[test]
+    fn router_mode_skips_unreachable_duplicate_ipv4_subnet_owner_like_tinc() {
+        tinc_test_support::assert_can_create_netns();
+        let mut state = duplicate_subnet_state();
+        let outcome = route_packet(
+            &mut state,
+            "myself",
+            &ipv4_packet(Ipv4Addr::new(10, 9, 0, 42)),
+            RouteConfig::default(),
+        );
+
+        assert_eq!(
+            RouteOutcome::new(RouteDecision::Send {
+                owner: "beta".to_owned(),
+                via: Some("beta".to_owned()),
+            }),
+            outcome
+        );
+    }
+
+    #[test]
     fn router_mode_routes_ipv6_to_subnet_owner() {
         tinc_test_support::assert_can_create_netns();
         let mut state = routed_state();
@@ -1942,6 +2041,26 @@ mod tests {
             RouteOutcome::new(RouteDecision::Send {
                 owner: "alpha".to_owned(),
                 via: Some("alpha".to_owned()),
+            }),
+            outcome
+        );
+    }
+
+    #[test]
+    fn router_mode_skips_unreachable_duplicate_ipv6_subnet_owner_like_tinc() {
+        tinc_test_support::assert_can_create_netns();
+        let mut state = duplicate_subnet_state();
+        let outcome = route_packet(
+            &mut state,
+            "myself",
+            &ipv6_packet("2001:db9::42".parse().unwrap()),
+            RouteConfig::default(),
+        );
+
+        assert_eq!(
+            RouteOutcome::new(RouteDecision::Send {
+                owner: "beta".to_owned(),
+                via: Some("beta".to_owned()),
             }),
             outcome
         );
@@ -2223,6 +2342,30 @@ mod tests {
             RouteDecision::Send {
                 owner: "alpha".to_owned(),
                 via: Some("alpha".to_owned()),
+            },
+            outcome.decision
+        );
+    }
+
+    #[test]
+    fn switch_mode_skips_unreachable_duplicate_mac_owner_like_tinc() {
+        tinc_test_support::assert_can_create_netns();
+        let mut state = duplicate_subnet_state();
+        let packet = ethernet_packet(mac(9), mac(1), ETH_P_IP, &[0; 20]);
+        let outcome = route_packet(
+            &mut state,
+            "myself",
+            &packet,
+            RouteConfig {
+                routing_mode: RoutingMode::Switch,
+                ..RouteConfig::default()
+            },
+        );
+
+        assert_eq!(
+            RouteDecision::Send {
+                owner: "beta".to_owned(),
+                via: Some("beta".to_owned()),
             },
             outcome.decision
         );

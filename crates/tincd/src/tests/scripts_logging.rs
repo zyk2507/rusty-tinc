@@ -277,6 +277,7 @@ fn runtime_learned_mac_subnets_run_scripts_broadcast_and_expire_like_tinc() {
             subnet: subnet.clone(),
         }])
         .unwrap();
+    runtime.flush_meta_outputs().unwrap();
 
     let mut buffer = [0u8; 512];
     let len = beta_stream.read(&mut buffer).unwrap();
@@ -295,6 +296,7 @@ fn runtime_learned_mac_subnets_run_scripts_broadcast_and_expire_like_tinc() {
     }));
 
     runtime.expire_dynamic_mac_subnets_at(101).unwrap();
+    runtime.flush_meta_outputs().unwrap();
     assert!(
         runtime
             .state
@@ -343,6 +345,7 @@ fn runtime_packet_diag_formats_only_sampled_entries() {
         },
     );
     let calls = std::cell::Cell::new(0);
+    runtime.set_debug_level(DEBUG_TRAFFIC);
 
     for _ in 0..9 {
         runtime.record_packet_diag("packet", |count| {
@@ -353,6 +356,31 @@ fn runtime_packet_diag_formats_only_sampled_entries() {
 
     assert_eq!(8, calls.get());
     assert_eq!(Some(&9), runtime.packet_diag_counts.get("packet"));
+}
+
+#[test]
+fn runtime_packet_diag_is_disabled_below_traffic_debug_level_like_tinc() {
+    tinc_test_support::assert_can_create_netns();
+    let config = RuntimeConfig::from_config_tree(&config_tree(&[("Name", "alpha")])).unwrap();
+    let mut runtime = RuntimeDaemonState::new(
+        Vec::new(),
+        &config,
+        RuntimeKeys {
+            private_key: Some(test_key(1)),
+            peer_public_keys: BTreeMap::new(),
+            rsa_private_key: None,
+            peer_rsa_public_keys: BTreeMap::new(),
+        },
+    );
+    let calls = std::cell::Cell::new(0);
+
+    runtime.record_packet_diag("packet", |count| {
+        calls.set(calls.get() + 1);
+        format!("diag packet count={count}")
+    });
+
+    assert_eq!(0, calls.get());
+    assert!(runtime.packet_diag_counts.is_empty());
 }
 
 #[test]

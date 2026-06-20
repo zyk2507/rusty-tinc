@@ -379,6 +379,7 @@ fn runtime_sptps_try_tx_recurses_to_legacy_relay_key_exchange_like_tinc() {
     }
 
     alpha.try_tx_like_tinc("beta", false).unwrap();
+    alpha.flush_meta_outputs().unwrap();
 
     let events = read_meta_events_until(&mut relay_stream, &mut relay_driver, |event| {
         matches!(
@@ -508,8 +509,8 @@ fn runtime_legacy_udp_data_uses_reverse_edge_before_latest_guess_like_tinc() {
     let mut legacy_key_actions = Vec::new();
     let mut sptps_key_actions = Vec::new();
     let mut mtu_reductions = Vec::new();
+    let mut legacy_nested_tx_targets = Vec::new();
     let mut traffic = BTreeMap::new();
-    let mut pcap_packets = VecDeque::new();
     #[cfg(unix)]
     let mut pcap_subscribers = Vec::new();
     let udp_socket_by_peer = BTreeMap::new();
@@ -536,8 +537,8 @@ fn runtime_legacy_udp_data_uses_reverse_edge_before_latest_guess_like_tinc() {
         legacy_key_actions: &mut legacy_key_actions,
         sptps_key_actions: &mut sptps_key_actions,
         mtu_reductions: &mut mtu_reductions,
+        legacy_nested_tx_targets: &mut legacy_nested_tx_targets,
         traffic: &mut traffic,
-        pcap_packets: &mut pcap_packets,
         #[cfg(unix)]
         pcap_subscribers: &mut pcap_subscribers,
         priority_inheritance: false,
@@ -664,8 +665,8 @@ fn runtime_legacy_over_min_mtu_uses_plain_meta_tcp_like_tinc() {
     let mut legacy_key_actions = Vec::new();
     let mut sptps_key_actions = Vec::new();
     let mut mtu_reductions = Vec::new();
+    let mut legacy_nested_tx_targets = Vec::new();
     let mut traffic = BTreeMap::new();
-    let mut pcap_packets = VecDeque::new();
     #[cfg(unix)]
     let mut pcap_subscribers = Vec::new();
     let addresses = NodeAddressTable::new();
@@ -696,8 +697,8 @@ fn runtime_legacy_over_min_mtu_uses_plain_meta_tcp_like_tinc() {
         legacy_key_actions: &mut legacy_key_actions,
         sptps_key_actions: &mut sptps_key_actions,
         mtu_reductions: &mut mtu_reductions,
+        legacy_nested_tx_targets: &mut legacy_nested_tx_targets,
         traffic: &mut traffic,
-        pcap_packets: &mut pcap_packets,
         #[cfg(unix)]
         pcap_subscribers: &mut pcap_subscribers,
         priority_inheritance: false,
@@ -706,6 +707,10 @@ fn runtime_legacy_over_min_mtu_uses_plain_meta_tcp_like_tinc() {
     transport
         .send_packet_to("beta", "beta", &VpnPacket::new(packet.clone()).unwrap())
         .unwrap();
+    drop(transport);
+    for connection in &mut meta_connections {
+        connection.flush_meta_output().unwrap();
+    }
 
     let events = read_meta_events_until(
         &mut beta_stream,
@@ -717,6 +722,136 @@ fn runtime_legacy_over_min_mtu_uses_plain_meta_tcp_like_tinc() {
     }));
     assert_eq!(1, traffic["beta"].out_packets);
     assert_eq!(packet.len() as u64, traffic["beta"].out_bytes);
+}
+
+#[test]
+fn runtime_legacy_pmtu_fallback_records_nested_try_tx_target_like_tinc() {
+    tinc_test_support::assert_can_create_netns();
+    let alpha_key = test_key(1);
+    let beta_key = test_key(2);
+    let server = config_tree(&[
+        ("Name", "alpha"),
+        ("ExperimentalProtocol", "no"),
+        ("StrictSubnets", "yes"),
+    ]);
+    let beta_host = config_tree(&[("Subnet", "10.2.0.0/16")]);
+    let gamma_host = config_tree(&[("Subnet", "10.3.0.0/16")]);
+    let config = RuntimeConfig::from_config_tree_with_hosts(
+        &server,
+        [("beta", &beta_host), ("gamma", &gamma_host)],
+    )
+    .unwrap();
+    let keys = RuntimeKeys {
+        private_key: Some(alpha_key.clone()),
+        peer_public_keys: BTreeMap::from([("beta".to_owned(), beta_key.public_key())]),
+        rsa_private_key: None,
+        peer_rsa_public_keys: BTreeMap::new(),
+    };
+    let Some((mut beta_stream, mut beta_driver, mut beta_connection)) =
+        active_runtime_connection("beta", alpha_key.clone(), beta_key.clone())
+    else {
+        return;
+    };
+    let mut alpha = RuntimeDaemonState::new(Vec::new(), &config, keys);
+    beta_connection.id = 1;
+    let mut meta_connections = vec![beta_connection];
+
+    {
+        let beta = alpha.state.graph.node_mut("beta").unwrap();
+        beta.status.reachable = true;
+        beta.route.next_hop = Some("beta".to_owned());
+    }
+    {
+        let gamma = alpha.state.graph.node_mut("gamma").unwrap();
+        gamma.status.reachable = true;
+        gamma.route.next_hop = Some("beta".to_owned());
+        gamma.route.via = Some("gamma".to_owned());
+        gamma.options = OPTION_PMTU_DISCOVERY;
+        gamma.min_mtu = 0;
+    }
+
+    let key_hex = "42".repeat(48);
+    let answer = AnswerKeyMessage {
+        from: "gamma".to_owned(),
+        to: "alpha".to_owned(),
+        key: key_hex,
+        cipher: LegacyCipherAlgorithm::Aes256Cbc.nid(),
+        digest: LegacyDigest::Sha256 { length: 4 }.nid(),
+        mac_length: 4,
+        compression: 0,
+        address: None,
+    };
+    alpha.apply_legacy_answer_key_message(&answer).unwrap();
+
+    let peer_options = alpha.peer_options_snapshot();
+    let legacy_key_snapshots = alpha.legacy_key_snapshot();
+    let mut packet_codec = runtime_sptps_packet_codec(&config, &alpha.state);
+    let mut legacy_codec = alpha.legacy_codec.clone();
+    let mut legacy_last_req_key = BTreeMap::new();
+    let mut legacy_key_actions = Vec::new();
+    let mut sptps_key_actions = Vec::new();
+    let mut mtu_reductions = Vec::new();
+    let mut legacy_nested_tx_targets = Vec::new();
+    let mut traffic = BTreeMap::new();
+    #[cfg(unix)]
+    let mut pcap_subscribers = Vec::new();
+    let addresses = NodeAddressTable::new();
+    let modern_peer_keys = BTreeMap::new();
+    let udp_socket_by_peer = BTreeMap::new();
+    let udp_target_snapshots = alpha.udp_target_snapshot();
+    let mut udp_unconfirmed_guess_counter = 0;
+    let sptps_route_snapshots = alpha.sptps_route_snapshot();
+    let sockets: Vec<RuntimeListenSocket> = Vec::new();
+    let mut transport = RuntimeUdpPacketTransport {
+        local_name: &alpha.local_name,
+        sockets: &sockets,
+        addresses: &addresses,
+        udp_socket_by_peer: &udp_socket_by_peer,
+        modern_peer_keys: &modern_peer_keys,
+        meta_connections: &mut meta_connections,
+        experimental: alpha.state.experimental,
+        local_tcp_only: alpha.local_tcp_only,
+        max_output_buffer_size: alpha.max_output_buffer_size,
+        peer_options,
+        packet_codec: &mut packet_codec,
+        legacy_codec: &mut legacy_codec,
+        udp_target_snapshots,
+        udp_unconfirmed_guess_counter: &mut udp_unconfirmed_guess_counter,
+        sptps_route_snapshots,
+        legacy_key_snapshots,
+        legacy_last_req_key: &mut legacy_last_req_key,
+        legacy_key_actions: &mut legacy_key_actions,
+        sptps_key_actions: &mut sptps_key_actions,
+        mtu_reductions: &mut mtu_reductions,
+        legacy_nested_tx_targets: &mut legacy_nested_tx_targets,
+        traffic: &mut traffic,
+        #[cfg(unix)]
+        pcap_subscribers: &mut pcap_subscribers,
+        priority_inheritance: false,
+    };
+    let packet = test_ipv4_ethernet_packet([10, 3, 0, 42]);
+
+    transport
+        .send_packet_to("gamma", "gamma", &VpnPacket::new(packet.clone()).unwrap())
+        .unwrap();
+    drop(transport);
+    for connection in &mut meta_connections {
+        connection.flush_meta_output().unwrap();
+    }
+
+    assert_eq!(
+        vec!["beta".to_owned()],
+        legacy_nested_tx_targets,
+        "C send_udppacket(gamma) PMTU fallback calls send_packet(beta), which runs try_tx(beta)"
+    );
+    let events = read_meta_events_until(
+        &mut beta_stream,
+        &mut beta_driver,
+        |event| matches!(event, MetaConnectionEvent::TcpPacket(payload) if payload == &packet),
+    );
+    assert!(events.iter().any(|event| {
+        matches!(event, MetaConnectionEvent::TcpPacket(payload) if payload == &packet)
+    }));
 }
 
 #[test]
@@ -789,6 +924,7 @@ fn runtime_legacy_tcponly_packet_does_not_try_udp_or_mtu_like_tinc() {
         .push_device_packet(VpnPacket::new(packet.clone()).unwrap())
         .unwrap();
     alpha.poll_once().unwrap();
+    alpha.flush_meta_outputs().unwrap();
 
     let events = read_meta_events_until(
         &mut beta_stream,

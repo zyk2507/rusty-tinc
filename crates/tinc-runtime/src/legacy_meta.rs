@@ -617,7 +617,7 @@ impl LegacyMetaConnectionDriver {
                 }
                 let plaintext = self.auth.decrypt_inbound(&self.raw_buffer)?;
                 self.raw_buffer.clear();
-                self.decoder.push(&plaintext);
+                self.decoder.push(&plaintext)?;
 
                 loop {
                     let Some(frame) = self.decoder.next_plaintext_frame()? else {

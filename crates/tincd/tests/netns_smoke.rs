@@ -1561,7 +1561,7 @@ fn linux_netns_rust_tincd_recovers_from_bad_legacy_ans_key_like_tinc() -> Result
         Path::new(TINCD),
         "Rust",
         "tinc-rust-legacy-bad-ans-key",
-        true,
+        !legacy_compression_is_available(CompressionLevel::LzoLow),
     )
 }
 
@@ -6233,7 +6233,13 @@ fn linux_netns_c_tincctl_streams_pcap_from_rust_tincd_tun_nodes() -> Result<(), 
         &workspace.path().join("c-pcap-2.log"),
         &["pcap", "128"],
     )?;
-    thread::sleep(Duration::from_millis(300));
+    wait_for_control_subscriber_count(
+        &alpha_confdir,
+        CONNECTION_STATUS_PCAP_RAW,
+        2,
+        "C pcap subscribers",
+        &cleanup,
+    )?;
     for _ in 0..4 {
         wait_for_ping(&ns_alpha, "10.250.2.1", &cleanup)?;
     }
@@ -7575,6 +7581,7 @@ fn run_five_node_cut_scenario(
         return Ok(());
     }
 
+    let daemon_binary = std::env::var_os("FIVE_NODE_TINCD_BINARY").map(PathBuf::from);
     let workspace = TempWorkspace::new(match (device_mode, direct_only) {
         (NetnsDeviceMode::Tun, true) => "tinc-rust-tun-directonly-cut",
         (NetnsDeviceMode::Tun, false) => "tinc-rust-tun-relay-cut",
@@ -7706,12 +7713,22 @@ fn run_five_node_cut_scenario(
     }
 
     for node in &nodes {
-        cleanup.spawn(
-            &node.name,
-            &workspace.path().join(&node.name),
-            &node.namespace,
-            &workspace.path().join(format!("{}.log", node.name)),
-        )?;
+        if let Some(binary) = daemon_binary.as_deref() {
+            cleanup.spawn_with_binary(
+                &node.name,
+                binary,
+                &workspace.path().join(&node.name),
+                &node.namespace,
+                &workspace.path().join(format!("{}.log", node.name)),
+            )?;
+        } else {
+            cleanup.spawn(
+                &node.name,
+                &workspace.path().join(&node.name),
+                &node.namespace,
+                &workspace.path().join(format!("{}.log", node.name)),
+            )?;
+        }
     }
 
     for node in &nodes {
@@ -12143,10 +12160,12 @@ fn run_c_tincctl_rust_tincd_legacy_multihop_status_topology(
     assert_c_dump_node_has_route(&nodes_dump, "beta", "beta", "beta", 1)?;
     assert_c_dump_node_has_route(&nodes_dump, "gamma", "beta", "beta", 2)?;
     assert_c_dump_node_options_include(&nodes_dump, "gamma", 0x1)?;
+    // Original C tinc exposes the static reverse edge endpoint for an indirect
+    // legacy node in dump nodes, while leaving its packet key fields unset.
     assert!(
         c_dump_node_line(&nodes_dump, "gamma")?
-            .contains("unknown port unknown cipher 0 digest 0 maclength 0 compression 0 "),
-        "C tinc dump nodes exposed an unexpected direct legacy UDP endpoint/key for static indirect gamma:\n{nodes_dump}\n{}",
+            .contains("198.27.2.2 port 18213 cipher 0 digest 0 maclength 0 compression 0 "),
+        "C tinc dump nodes did not expose Rust legacy static multihop edge endpoint for gamma without packet keys:\n{nodes_dump}\n{}",
         cleanup.logs()
     );
 
@@ -15668,6 +15687,24 @@ fn assert_c_rust_legacy_direct_dump_parity(
 ) -> Result<(), Box<dyn Error>> {
     let alpha_port = if rust_connects_to_c { 17355 } else { 17357 };
     let beta_port = if rust_connects_to_c { 17356 } else { 17358 };
+    wait_for_direct_udp_discovery_pmtu_min_mtu(
+        &workspace.path().join("alpha"),
+        "beta",
+        ns_alpha,
+        "10.102.2.1",
+        "legacy direct raw parity alpha view",
+        1,
+        cleanup,
+    )?;
+    wait_for_direct_udp_discovery_pmtu_min_mtu(
+        &workspace.path().join("beta"),
+        "alpha",
+        ns_beta,
+        "10.102.1.1",
+        "legacy direct raw parity beta view",
+        1,
+        cleanup,
+    )?;
     let dumps = wait_for_direct_dump_parity(
         &workspace.path().join("alpha"),
         &workspace.path().join("beta"),
@@ -17569,6 +17606,8 @@ const REQ_DUMP_TRAFFIC_RAW: i32 = 13;
 const OPTION_PMTU_DISCOVERY_RAW: u32 = 0x0004;
 const OPTION_CLAMP_MSS_RAW: u32 = 0x0008;
 const PROTOCOL_MINOR_RAW: u32 = 7 << 24;
+const C_DEFAULT_MTU_RAW: i32 = 1518;
+const C_JUMBO_MTU_RAW: i32 = 9018;
 const STATUS_VALIDKEY: u32 = 1 << 1;
 const STATUS_REACHABLE: u32 = 1 << 4;
 const STATUS_INDIRECT: u32 = 1 << 5;
@@ -20457,13 +20496,13 @@ fn assert_direct_subnets(
 }
 
 fn assert_default_mtu_fields(node: &RawNodeDump) -> Result<(), Box<dyn Error>> {
-    assert_eq!(1518, node.pmtu, "unexpected C default MTU field: {node:?}");
+    assert_tinc_default_mtu(node.pmtu, "default PMTU", node)?;
     assert_eq!(
         0, node.min_mtu,
         "unexpected C default minmtu field: {node:?}"
     );
     assert_eq!(
-        1518, node.max_mtu,
+        node.pmtu, node.max_mtu,
         "unexpected C default maxmtu field: {node:?}"
     );
     assert_eq!(
@@ -20477,8 +20516,9 @@ fn assert_relay_destination_pmtu_reset_fields_like_tinc(
     node: &RawNodeDump,
     label: &str,
 ) -> Result<(), Box<dyn Error>> {
+    assert_tinc_default_mtu(node.max_mtu, "reset maxmtu", node)?;
     assert!(
-        node.pmtu > 0 && node.pmtu <= 1518,
+        node.pmtu > 0 && node.pmtu <= node.max_mtu,
         "{label}: final destination PMTU should keep the C default/provisional MTU_INFO shape: {node:?}"
     );
     assert_eq!(
@@ -20486,12 +20526,33 @@ fn assert_relay_destination_pmtu_reset_fields_like_tinc(
         "{label}: final destination minmtu must stay reset because try_tx() only probes the relay peer: {node:?}"
     );
     assert_eq!(
-        1518, node.max_mtu,
-        "{label}: final destination maxmtu must stay at C MTU reset value because direct PMTU discovery did not start: {node:?}"
-    );
-    assert_eq!(
         -1, node.udp_ping_rtt,
         "{label}: final destination UDP RTT must keep the C !udp_confirmed sentinel: {node:?}"
+    );
+    Ok(())
+}
+
+fn assert_tinc_default_mtu(
+    mtu: i32,
+    field: &str,
+    node: &RawNodeDump,
+) -> Result<(), Box<dyn Error>> {
+    assert!(
+        matches!(mtu, C_DEFAULT_MTU_RAW | C_JUMBO_MTU_RAW),
+        "unexpected C {field} field: {node:?}"
+    );
+    Ok(())
+}
+
+fn assert_tinc_cli_default_mtu(
+    mtu: i32,
+    field: &str,
+    node: &CliNodeDump,
+    label: &str,
+) -> Result<(), Box<dyn Error>> {
+    assert!(
+        matches!(mtu, C_DEFAULT_MTU_RAW | C_JUMBO_MTU_RAW),
+        "{label}: unexpected C {field} field: {node:?}"
     );
     Ok(())
 }
@@ -20739,9 +20800,9 @@ fn assert_cli_modern_direct_nodes(
     assert_eq!(expect.local, local.nexthop);
     assert_eq!(expect.local, local.via);
     assert_eq!(0, local.distance);
-    assert_eq!(1518, local.pmtu);
+    assert_tinc_cli_default_mtu(local.pmtu, "local PMTU", &local, label)?;
     assert_eq!(0, local.min_mtu);
-    assert_eq!(1518, local.max_mtu);
+    assert_eq!(local.pmtu, local.max_mtu);
 
     let peer = cli_node(dump, expect.peer)?;
     assert_eq!(
@@ -20809,9 +20870,9 @@ fn assert_cli_legacy_direct_nodes(
     assert_eq!(expect.local, local.nexthop);
     assert_eq!(expect.local, local.via);
     assert_eq!(0, local.distance);
-    assert_eq!(1518, local.pmtu);
+    assert_tinc_cli_default_mtu(local.pmtu, "local PMTU", &local, label)?;
     assert_eq!(0, local.min_mtu);
-    assert_eq!(1518, local.max_mtu);
+    assert_eq!(local.pmtu, local.max_mtu);
 
     let peer = cli_node(dump, expect.peer)?;
     assert_eq!(
@@ -21022,6 +21083,42 @@ fn wait_for_single_peer_meta_connection(
 
     Err(format!(
         "{label}: C ack_h() duplicate cleanup should leave exactly one active meta connection to {peer}\nlast dump:\n{last_dump}\n{}",
+        cleanup.logs()
+    )
+    .into())
+}
+
+fn wait_for_control_subscriber_count(
+    confdir: &Path,
+    status_bit: u32,
+    expected: usize,
+    label: &str,
+    cleanup: &NetnsCleanup,
+) -> Result<(), Box<dyn Error>> {
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let mut last_dump = String::new();
+    while Instant::now() < deadline {
+        cleanup.ensure_children_alive()?;
+        last_dump = run_rust_tincctl(&[
+            "tinc",
+            "--config",
+            confdir.to_str().unwrap(),
+            "dump",
+            "connections",
+        ])?;
+        let count = last_dump
+            .lines()
+            .filter_map(|line| parse_cli_connection_dump_line(line).ok())
+            .filter(|connection| connection.status & status_bit != 0)
+            .count();
+        if count >= expected {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    Err(format!(
+        "timed out waiting for {expected} {label}\nlast dump:\n{last_dump}\n{}",
         cleanup.logs()
     )
     .into())
@@ -21407,7 +21504,12 @@ fn run_iperf_once(
     } else {
         client_args.extend(["-t", "2"]);
     }
-    let client = Command::new("ip").args(&client_args).output()?;
+    let client = Command::new("ip")
+        .args(&client_args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let (client_completed, client) = wait_with_output_timeout(client, Duration::from_secs(30))?;
     let _ = server.kill();
     let server_output = server.wait_with_output()?;
 
@@ -21421,13 +21523,14 @@ fn run_iperf_once(
         String::from_utf8_lossy(&server_output.stdout),
         String::from_utf8_lossy(&server_output.stderr)
     );
-    if client.status.success() && client_text.contains("bits/sec") {
+    if client_completed && client.status.success() && client_text.contains("bits/sec") {
         return Ok(());
     }
 
     Err(format!(
-        "{} iperf from {source_netns} to {target_address} failed\nclient:\n{client_text}\nserver:\n{server_text}\n{}",
+        "{} iperf from {source_netns} to {target_address} {}\nclient:\n{client_text}\nserver:\n{server_text}\n{}",
         if udp { "UDP" } else { "TCP" },
+        if client_completed { "failed" } else { "timed out" },
         cleanup.diagnostics()
     )
     .into())

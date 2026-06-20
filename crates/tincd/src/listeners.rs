@@ -495,7 +495,7 @@ pub(crate) fn set_udp_socket_priority_fd(fd: i32, remote: SocketAddr, priority: 
 pub(crate) fn set_udp_socket_priority_fd(_fd: i32, _remote: SocketAddr, _priority: i32) {}
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
-pub(crate) const IPTOS_LOWDELAY: libc::c_int = 0x10;
+pub(crate) const IPTOS_LOWDELAY: libc::c_int = libc::IPTOS_LOWDELAY as libc::c_int;
 
 #[cfg(unix)]
 pub(crate) fn configure_tcp_stream(stream: &TcpStream, fwmark: i32) -> io::Result<()> {
@@ -595,11 +595,10 @@ pub(crate) fn bind_socket_to_interface(_fd: i32, _interface: &str) -> io::Result
 #[cfg(unix)]
 pub(crate) fn connect_tcp_stream(
     address: SocketAddr,
-    timeout: Duration,
     fwmark: i32,
     bind_to_interface: Option<&str>,
     bind_address: Option<SocketAddr>,
-) -> io::Result<TcpStream> {
+) -> io::Result<(TcpStream, bool)> {
     let family = match address {
         SocketAddr::V4(_) => libc::AF_INET,
         SocketAddr::V6(_) => libc::AF_INET6,
@@ -636,27 +635,20 @@ pub(crate) fn connect_tcp_stream(
             return Err(error);
         }
 
-        wait_for_outgoing_connect(fd, timeout)?;
+        return Ok((unsafe { TcpStream::from_raw_fd(fd) }, true));
     }
 
-    if let Err(error) = set_raw_fd_nonblocking(fd, false) {
-        unsafe {
-            libc::close(fd);
-        }
-        return Err(error);
-    }
-    Ok(unsafe { TcpStream::from_raw_fd(fd) })
+    Ok((unsafe { TcpStream::from_raw_fd(fd) }, false))
 }
 
 #[cfg(not(unix))]
 pub(crate) fn connect_tcp_stream(
     address: SocketAddr,
-    timeout: Duration,
     _fwmark: i32,
     _bind_to_interface: Option<&str>,
     _bind_address: Option<SocketAddr>,
-) -> io::Result<TcpStream> {
-    TcpStream::connect_timeout(&address, timeout)
+) -> io::Result<(TcpStream, bool)> {
+    TcpStream::connect(address).map(|stream| (stream, false))
 }
 
 #[cfg(unix)]
@@ -676,57 +668,6 @@ pub(crate) fn configure_outgoing_tcp_fd(
     if let Some(bind_address) = bind_address {
         let _ = bind_raw_socket(fd, bind_address);
     }
-    Ok(())
-}
-
-#[cfg(unix)]
-pub(crate) fn wait_for_outgoing_connect(fd: i32, timeout: Duration) -> io::Result<()> {
-    let timeout_ms = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
-    let mut pollfd = libc::pollfd {
-        fd,
-        events: libc::POLLOUT,
-        revents: 0,
-    };
-    let poll_result = unsafe { libc::poll(&mut pollfd, 1, timeout_ms) };
-    if poll_result == 0 {
-        unsafe {
-            libc::close(fd);
-        }
-        return Err(io::Error::new(io::ErrorKind::TimedOut, "connect timed out"));
-    }
-    if poll_result < 0 {
-        let error = io::Error::last_os_error();
-        unsafe {
-            libc::close(fd);
-        }
-        return Err(error);
-    }
-
-    let mut socket_error: libc::c_int = 0;
-    let mut length = std::mem::size_of_val(&socket_error) as libc::socklen_t;
-    if unsafe {
-        libc::getsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_ERROR,
-            (&mut socket_error as *mut libc::c_int).cast(),
-            &mut length,
-        )
-    } < 0
-    {
-        let error = io::Error::last_os_error();
-        unsafe {
-            libc::close(fd);
-        }
-        return Err(error);
-    }
-    if socket_error != 0 {
-        unsafe {
-            libc::close(fd);
-        }
-        return Err(io::Error::from_raw_os_error(socket_error));
-    }
-
     Ok(())
 }
 
@@ -1082,6 +1023,10 @@ impl RuntimeSignalHandlers {
                 "System call `read` failed: {error}"
             )));
         }
+    }
+
+    pub(crate) fn read_fd(&self) -> RawFd {
+        self.read_fd
     }
 }
 

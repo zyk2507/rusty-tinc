@@ -16,6 +16,9 @@ pub(crate) const REQ_PCAP: i32 = 14;
 pub(crate) const REQ_LOG: i32 = 15;
 pub(crate) const DEBUG_UNSET: i32 = -1;
 pub(crate) const DEBUG_NOTHING: i32 = 0;
+pub(crate) const DEBUG_CONNECTIONS: i32 = 1;
+pub(crate) const DEBUG_PROTOCOL: i32 = 3;
+pub(crate) const DEBUG_TRAFFIC: i32 = 5;
 pub(crate) const DEBUG_SCARY_THINGS: i32 = 10;
 pub(crate) const LOG_EMERG: i32 = 0;
 pub(crate) const LOG_ALERT: i32 = 1;
@@ -27,10 +30,12 @@ pub(crate) const LOG_INFO: i32 = 6;
 pub(crate) const LOG_DEBUG: i32 = 7;
 pub(crate) const LOG_CONTROL_BUFFER_SIZE: usize = 1024;
 pub(crate) const PCAP_CONTROL_BUFFER_SIZE: usize = 9018;
-pub(crate) const CONTROL_LOG_RING_CAPACITY: usize = 256;
-pub(crate) const CONTROL_PCAP_RING_CAPACITY: usize = 256;
-pub(crate) const CONTROL_SUBSCRIBER_QUEUE_CAPACITY: usize = 256;
-pub(crate) const MAC_SUBNET_AGE_INTERVAL: Duration = Duration::from_secs(10);
+pub(crate) const TINC_AGING_INTERVAL: Duration = Duration::from_secs(10);
+pub(crate) const DEVICE_READ_ERROR_BACKOFF_STEP: Duration = Duration::from_millis(50);
+pub(crate) const DEVICE_READ_ERROR_LIMIT: u32 = 10;
+pub(crate) const TOPOLOGY_CONTRADICTION_LIMIT: u32 = 100;
+pub(crate) const TOPOLOGY_BACKOFF_MIN: Duration = Duration::from_secs(10);
+pub(crate) const TOPOLOGY_BACKOFF_MAX: Duration = Duration::from_secs(3600);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ControlEndpoint {
@@ -137,11 +142,7 @@ pub fn remove_control_files(endpoint: &ControlEndpoint) {
     let _ = fs::remove_file(&endpoint.pidfile);
 }
 
-pub(crate) const FOREGROUND_IDLE_SLEEP: Duration = Duration::from_millis(50);
-pub(crate) const OUTGOING_CONNECT_TIMEOUT: Duration = Duration::from_millis(50);
 pub(crate) const AUTOCONNECT_INTERVAL: Duration = Duration::from_secs(5);
-pub(crate) const DEVICE_DRAIN_BUDGET: usize = 256;
-pub(crate) const UDP_DRAIN_BUDGET_PER_SOCKET: usize = 256;
 pub(crate) const OUTGOING_CONNECT_RETRY_STEP_SECS: u64 = 5;
 pub(crate) const SPTPS_UDP_ROUTER_PACKET_TYPE: u8 = 0;
 pub(crate) const SPTPS_UDP_PROBE_TYPE: u8 = 4;

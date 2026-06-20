@@ -3,6 +3,8 @@ use rand_core::OsRng;
 use rsa::pkcs1::{EncodeRsaPrivateKey, EncodeRsaPublicKey, LineEnding};
 use rsa::traits::{PrivateKeyParts, PublicKeyParts};
 use std::fs;
+#[cfg(unix)]
+use std::sync::atomic::{AtomicU16, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration as StdDuration, SystemTime, UNIX_EPOCH};
 use tinc_core::config::ConfigSource;
@@ -85,8 +87,118 @@ impl Drop for EnvVarGuard {
     }
 }
 
+#[cfg(unix)]
+static SYSTEMD_LISTEN_TEST_PORT: AtomicU16 = AtomicU16::new(20_000);
+
+#[cfg(unix)]
+fn bind_systemd_test_tcp_listener(index: u8) -> TcpListener {
+    let address = Ipv4Addr::new(127, 77, index, 1);
+    for _ in 0..2000 {
+        let port = SYSTEMD_LISTEN_TEST_PORT.fetch_add(1, AtomicOrdering::Relaxed);
+        let socket = SocketAddr::new(IpAddr::V4(address), port);
+        let Ok(listener) = TcpListener::bind(socket) else {
+            continue;
+        };
+        match UdpSocket::bind(socket) {
+            Ok(udp_probe) => {
+                drop(udp_probe);
+                return listener;
+            }
+            Err(_) => drop(listener),
+        }
+    }
+
+    panic!("failed to allocate a systemd listen test socket for {address}");
+}
+
 fn args(values: &[&str]) -> Vec<String> {
     values.iter().map(|value| (*value).to_owned()).collect()
+}
+
+fn drive_until_no_meta_connections(runtime: &mut RuntimeDaemonState) {
+    let deadline = Instant::now() + StdDuration::from_secs(1);
+    loop {
+        runtime.poll_once().unwrap();
+        if runtime.meta_connection_infos().is_empty() {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "runtime did not close the pending meta connection"
+        );
+        thread::sleep(StdDuration::from_millis(10));
+    }
+}
+
+fn drive_outgoing_meta_output(runtime: &mut RuntimeDaemonState) {
+    let deadline = Instant::now() + StdDuration::from_secs(1);
+    loop {
+        runtime.poll_once().unwrap();
+        runtime.flush_meta_outputs().unwrap();
+        if runtime
+            .meta_connections
+            .iter()
+            .any(|connection| !connection.connecting && connection.bytes_written > 0)
+        {
+            return;
+        }
+        assert!(
+            !runtime.meta_connections.is_empty(),
+            "outgoing meta connection closed before writing the initial prelude"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "outgoing meta connection did not write the initial prelude"
+        );
+        thread::sleep(StdDuration::from_millis(10));
+    }
+}
+
+fn flush_outgoing_meta_output(runtime: &mut RuntimeDaemonState) {
+    let deadline = Instant::now() + StdDuration::from_secs(1);
+    loop {
+        runtime.flush_meta_outputs().unwrap();
+        if runtime
+            .meta_connections
+            .iter()
+            .any(|connection| !connection.connecting && connection.bytes_written > 0)
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "outgoing meta connection did not flush the initial prelude"
+        );
+        thread::sleep(StdDuration::from_millis(10));
+    }
+}
+
+fn accept_after_runtime_progress(
+    listener: &TcpListener,
+    runtime: &mut RuntimeDaemonState,
+) -> (TcpStream, SocketAddr) {
+    listener.set_nonblocking(true).unwrap();
+    let deadline = Instant::now() + StdDuration::from_secs(1);
+    loop {
+        match listener.accept() {
+            Ok(accepted) => {
+                listener.set_nonblocking(false).unwrap();
+                accepted
+                    .0
+                    .set_read_timeout(Some(StdDuration::from_secs(1)))
+                    .unwrap();
+                return accepted;
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+            Err(error) => panic!("failed to accept outgoing test connection: {error}"),
+        }
+        runtime.poll_once().unwrap();
+        assert!(
+            Instant::now() < deadline,
+            "runtime did not connect to the expected listener"
+        );
+        thread::sleep(StdDuration::from_millis(10));
+    }
 }
 
 fn config_tree(configs: &[(&str, &str)]) -> ConfigTree {
@@ -342,7 +454,7 @@ fn recv_sptps_probe_payload(
     peer: &str,
     expected_source: SocketAddr,
 ) -> Vec<u8> {
-    let mut buffer = [0u8; 4096];
+    let mut buffer = vec![0u8; MAX_DATAGRAM_SIZE];
     let deadline = Instant::now() + StdDuration::from_secs(1);
     let len = loop {
         match receiver.listen_sockets[0].udp.recv_from(&mut buffer) {
@@ -503,6 +615,19 @@ where
     events
 }
 
+fn flush_then_read_meta_events_until<F>(
+    runtime: &mut RuntimeDaemonState,
+    stream: &mut TcpStream,
+    driver: &mut MetaConnectionDriver,
+    predicate: F,
+) -> Vec<MetaConnectionEvent>
+where
+    F: Fn(&MetaConnectionEvent) -> bool,
+{
+    runtime.flush_meta_outputs().unwrap();
+    read_meta_events_until(stream, driver, predicate)
+}
+
 fn active_runtime_connection(
     peer: &str,
     alpha_key: TincEd25519PrivateKey,
@@ -536,10 +661,14 @@ fn active_runtime_connection(
             outbound_offset: 0,
             status: CONNECTION_STATUS_ACTIVE,
             options: (PROT_MINOR as u32) << 24,
+            outgoing_peer: None,
             outgoing_autoconnect: false,
+            connecting: false,
             close_requested: false,
             last_activity: Instant::now(),
+            last_ping_time: Instant::now(),
             last_ping_sent: None,
+            edge_peer: None,
             exec_proxy: None,
             kind: RuntimeMetaConnectionKind::Active {
                 driver: RuntimeMetaDriver::modern(alpha_driver),
@@ -651,10 +780,14 @@ fn active_legacy_runtime_connection(
             outbound_offset: 0,
             status: CONNECTION_STATUS_ACTIVE,
             options: 0,
+            outgoing_peer: None,
             outgoing_autoconnect: false,
+            connecting: false,
             close_requested: false,
             last_activity: Instant::now(),
+            last_ping_time: Instant::now(),
             last_ping_sent: None,
+            edge_peer: None,
             exec_proxy: None,
             kind: RuntimeMetaConnectionKind::Active {
                 driver: RuntimeMetaDriver::legacy(alpha_driver),

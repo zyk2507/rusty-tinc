@@ -26,6 +26,68 @@ impl RuntimeListenSocket {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RuntimeTopologyBackoff {
+    pub(crate) contradicting_add_edge: u32,
+    pub(crate) contradicting_del_edge: u32,
+    pub(crate) delay: Duration,
+    pub(crate) until: Option<Instant>,
+}
+
+impl Default for RuntimeTopologyBackoff {
+    fn default() -> Self {
+        Self {
+            contradicting_add_edge: 0,
+            contradicting_del_edge: 0,
+            delay: TOPOLOGY_BACKOFF_MIN,
+            until: None,
+        }
+    }
+}
+
+impl RuntimeTopologyBackoff {
+    pub(crate) fn active(&self, now: Instant) -> bool {
+        self.until.is_some_and(|deadline| now < deadline)
+    }
+
+    pub(crate) fn note_add_edge(&mut self) {
+        self.contradicting_add_edge = self.contradicting_add_edge.saturating_add(1);
+    }
+
+    pub(crate) fn note_del_edge(&mut self) {
+        self.contradicting_del_edge = self.contradicting_del_edge.saturating_add(1);
+    }
+
+    pub(crate) fn apply_periodic_check(&mut self, now: Instant) -> Option<Duration> {
+        if self.active(now) {
+            self.contradicting_add_edge = 0;
+            self.contradicting_del_edge = 0;
+            return None;
+        }
+
+        let should_backoff = self.contradicting_add_edge > TOPOLOGY_CONTRADICTION_LIMIT
+            && self.contradicting_del_edge > TOPOLOGY_CONTRADICTION_LIMIT;
+
+        self.contradicting_add_edge = 0;
+        self.contradicting_del_edge = 0;
+
+        if should_backoff {
+            let delay = self.delay;
+            self.until = Some(now + delay);
+            self.delay = self
+                .delay
+                .checked_mul(2)
+                .filter(|delay| *delay <= TOPOLOGY_BACKOFF_MAX)
+                .unwrap_or(TOPOLOGY_BACKOFF_MAX);
+            Some(delay)
+        } else {
+            self.until = None;
+            self.delay = (self.delay / 2).max(TOPOLOGY_BACKOFF_MIN);
+            None
+        }
+    }
+}
+
 pub(crate) struct RuntimeUdpPacketTransport<'a> {
     pub(crate) local_name: &'a str,
     pub(crate) sockets: &'a [RuntimeListenSocket],
@@ -47,8 +109,8 @@ pub(crate) struct RuntimeUdpPacketTransport<'a> {
     pub(crate) legacy_key_actions: &'a mut Vec<RuntimeLegacyKeyAction>,
     pub(crate) sptps_key_actions: &'a mut Vec<RuntimeSptpsKeyAction>,
     pub(crate) mtu_reductions: &'a mut Vec<(String, usize)>,
+    pub(crate) legacy_nested_tx_targets: &'a mut Vec<String>,
     pub(crate) traffic: &'a mut BTreeMap<String, TrafficCounters>,
-    pub(crate) pcap_packets: &'a mut VecDeque<Vec<u8>>,
     pub(crate) pcap_subscribers: &'a mut Vec<RuntimeControlPcapSubscriber>,
     pub(crate) priority_inheritance: bool,
 }
@@ -57,13 +119,114 @@ pub(crate) struct RuntimeUdpPacketTransport<'a> {
 pub(crate) struct RuntimeControlLogSubscriber {
     pub(crate) level: i32,
     pub(crate) colorize: bool,
-    pub(crate) sender: mpsc::SyncSender<Vec<u8>>,
+    pub(crate) writer: RuntimeControlSubscriberWriter,
 }
 
 #[derive(Debug)]
 pub(crate) struct RuntimeControlPcapSubscriber {
     pub(crate) snaplen: usize,
-    pub(crate) sender: mpsc::SyncSender<Vec<u8>>,
+    pub(crate) writer: RuntimeControlSubscriberWriter,
+}
+
+#[derive(Debug)]
+pub(crate) struct RuntimeControlSubscriberWriter {
+    pub(crate) id: u64,
+    pub(crate) stream: RuntimeControlSubscriberStream,
+    pub(crate) outbound: Vec<u8>,
+    pub(crate) outbound_offset: usize,
+}
+
+#[derive(Debug)]
+pub(crate) enum RuntimeControlSubscriberStream {
+    Tcp(TcpStream),
+    #[cfg(unix)]
+    Unix(std::os::unix::net::UnixStream),
+}
+
+impl RuntimeControlSubscriberStream {
+    pub(crate) fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
+        match self {
+            Self::Tcp(stream) => stream.set_nonblocking(nonblocking),
+            #[cfg(unix)]
+            Self::Unix(stream) => stream.set_nonblocking(nonblocking),
+        }
+    }
+
+    pub(crate) fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Tcp(stream) => stream.write(data),
+            #[cfg(unix)]
+            Self::Unix(stream) => stream.write(data),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl AsRawFd for RuntimeControlSubscriberStream {
+    fn as_raw_fd(&self) -> RawFd {
+        match self {
+            Self::Tcp(stream) => stream.as_raw_fd(),
+            Self::Unix(stream) => stream.as_raw_fd(),
+        }
+    }
+}
+
+impl RuntimeControlSubscriberWriter {
+    pub(crate) fn new(id: u64, stream: RuntimeControlSubscriberStream) -> io::Result<Self> {
+        stream.set_nonblocking(true)?;
+        Ok(Self {
+            id,
+            stream,
+            outbound: Vec::new(),
+            outbound_offset: 0,
+        })
+    }
+
+    pub(crate) fn has_pending_output(&self) -> bool {
+        self.outbound_offset < self.outbound.len()
+    }
+
+    pub(crate) fn queue_payload(&mut self, request: i32, payload: &[u8]) {
+        self.compact_outbound();
+        let control = Request::Control.number();
+        self.outbound
+            .extend_from_slice(format!("{control} {request} {}\n", payload.len()).as_bytes());
+        self.outbound.extend_from_slice(payload);
+    }
+
+    pub(crate) fn flush_once(&mut self) -> io::Result<RuntimeIoProgress> {
+        if !self.has_pending_output() {
+            return Ok(RuntimeIoProgress::NotReady);
+        }
+
+        match self.stream.write(&self.outbound[self.outbound_offset..]) {
+            Ok(0) => Ok(RuntimeIoProgress::NotReady),
+            Ok(len) => {
+                self.outbound_offset += len;
+                if !self.has_pending_output() {
+                    self.outbound.clear();
+                    self.outbound_offset = 0;
+                }
+                Ok(RuntimeIoProgress::Processed)
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                Ok(RuntimeIoProgress::NotReady)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    pub(crate) fn compact_outbound(&mut self) {
+        if self.outbound_offset == 0 {
+            return;
+        }
+        if self.outbound_offset >= self.outbound.len() {
+            self.outbound.clear();
+        } else {
+            self.outbound.drain(..self.outbound_offset);
+        }
+        self.outbound_offset = 0;
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -87,12 +250,6 @@ pub(crate) struct RuntimeSptpsRouteSnapshot {
 pub(crate) struct SptpsTransportTargets {
     pub(crate) udp_relay: String,
     pub(crate) tcp_target: String,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum SptpsRelaySelection {
-    HonorRoute,
-    PreferVia,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -129,8 +286,6 @@ impl PacketTransport for RuntimeUdpPacketTransport<'_> {
         if self.sptps_direct_needs_plain_tcp_fallback(owner, packet) {
             self.send_tcp_packet(owner, packet)?;
             record_outbound_traffic(self.traffic, owner, packet.len());
-            push_control_pcap_packet(self.pcap_packets, &packet.data);
-            #[cfg(unix)]
             publish_control_pcap_packet(self.pcap_subscribers, &packet.data);
             return Ok(());
         }
@@ -142,13 +297,11 @@ impl PacketTransport for RuntimeUdpPacketTransport<'_> {
                 .map(|peer| peer.packet_type())
                 .expect("peer checked above");
             let payload_len = sptps_payload_from_packet(packet_type, packet)?.len();
-            let targets = self.sptps_transport_targets(owner, relay, payload_len);
+            let targets = self.sptps_transport_targets(owner, relay, payload_len, packet_type);
 
             if self.sptps_needs_tcp_fallback(owner, &targets.udp_relay, payload_len) {
                 self.send_sptps_tcp_packet(owner, &targets.tcp_target, packet)?;
                 record_outbound_traffic(self.traffic, owner, packet.len());
-                push_control_pcap_packet(self.pcap_packets, &packet.data);
-                #[cfg(unix)]
                 publish_control_pcap_packet(self.pcap_subscribers, &packet.data);
                 return Ok(());
             }
@@ -185,8 +338,6 @@ impl PacketTransport for RuntimeUdpPacketTransport<'_> {
                     self.mtu_reductions
                         .push((targets.udp_relay.clone(), payload_len.saturating_sub(1)));
                     record_outbound_traffic(self.traffic, owner, packet.len());
-                    push_control_pcap_packet(self.pcap_packets, &packet.data);
-                    #[cfg(unix)]
                     publish_control_pcap_packet(self.pcap_subscribers, &packet.data);
                     return Ok(());
                 }
@@ -200,8 +351,6 @@ impl PacketTransport for RuntimeUdpPacketTransport<'_> {
             }
 
             record_outbound_traffic(self.traffic, owner, packet.len());
-            push_control_pcap_packet(self.pcap_packets, &packet.data);
-            #[cfg(unix)]
             publish_control_pcap_packet(self.pcap_subscribers, &packet.data);
 
             return Ok(());
@@ -210,8 +359,6 @@ impl PacketTransport for RuntimeUdpPacketTransport<'_> {
         if self.should_send_tcp_packet(relay, packet) {
             self.send_tcp_packet(relay, packet)?;
             record_outbound_traffic(self.traffic, owner, packet.len());
-            push_control_pcap_packet(self.pcap_packets, &packet.data);
-            #[cfg(unix)]
             publish_control_pcap_packet(self.pcap_subscribers, &packet.data);
             return Ok(());
         }
@@ -221,8 +368,6 @@ impl PacketTransport for RuntimeUdpPacketTransport<'_> {
             self.enqueue_legacy_key_actions(relay);
             if result.is_ok() {
                 record_outbound_traffic(self.traffic, owner, packet.len());
-                push_control_pcap_packet(self.pcap_packets, &packet.data);
-                #[cfg(unix)]
                 publish_control_pcap_packet(self.pcap_subscribers, &packet.data);
             }
             return Ok(());
@@ -234,13 +379,18 @@ impl PacketTransport for RuntimeUdpPacketTransport<'_> {
                 self.enqueue_legacy_key_actions(relay);
                 if result.is_ok() {
                     record_outbound_traffic(self.traffic, owner, packet.len());
-                    push_control_pcap_packet(self.pcap_packets, &packet.data);
-                    #[cfg(unix)]
                     publish_control_pcap_packet(self.pcap_subscribers, &packet.data);
                 }
                 return Ok(());
             }
 
+            if !self
+                .legacy_nested_tx_targets
+                .iter()
+                .any(|queued| queued == &next_hop)
+            {
+                self.legacy_nested_tx_targets.push(next_hop.clone());
+            }
             self.send_packet_to(&next_hop, &next_hop, packet)?;
             if owner != next_hop {
                 record_outbound_traffic(self.traffic, owner, packet.len());
@@ -305,8 +455,6 @@ impl PacketTransport for RuntimeUdpPacketTransport<'_> {
                 self.mtu_reductions
                     .push((relay.to_owned(), packet.len().saturating_sub(1)));
                 record_outbound_traffic(self.traffic, owner, packet.len());
-                push_control_pcap_packet(self.pcap_packets, &packet.data);
-                #[cfg(unix)]
                 publish_control_pcap_packet(self.pcap_subscribers, &packet.data);
                 return Ok(());
             }
@@ -320,8 +468,6 @@ impl PacketTransport for RuntimeUdpPacketTransport<'_> {
         }
 
         record_outbound_traffic(self.traffic, owner, packet.len());
-        push_control_pcap_packet(self.pcap_packets, &packet.data);
-        #[cfg(unix)]
         publish_control_pcap_packet(self.pcap_subscribers, &packet.data);
 
         Ok(())
@@ -421,27 +567,24 @@ pub(crate) fn choose_sptps_transport_targets(
     owner: &str,
     relay_hint: &str,
     payload_len: usize,
-    relay_selection: SptpsRelaySelection,
+    static_via_probe: bool,
 ) -> SptpsTransportTargets {
     let tcp_target = snapshots
         .get(owner)
         .and_then(|snapshot| snapshot.next_hop.clone())
         .unwrap_or_else(|| relay_hint.to_owned());
 
-    let udp_relay = match relay_selection {
-        SptpsRelaySelection::HonorRoute => relay_hint.to_owned(),
-        SptpsRelaySelection::PreferVia => snapshots
-            .get(owner)
-            .and_then(|snapshot| snapshot.via.as_deref())
-            .filter(|via| *via != local_name)
-            .and_then(|via| {
-                snapshots
-                    .get(via)
-                    .filter(|via_snapshot| payload_len <= via_snapshot.min_mtu)
-                    .map(|_| via.to_owned())
-            })
-            .unwrap_or_else(|| tcp_target.clone()),
-    };
+    let udp_relay = snapshots
+        .get(owner)
+        .and_then(|snapshot| snapshot.via.as_deref())
+        .filter(|via| *via != local_name)
+        .and_then(|via| {
+            snapshots
+                .get(via)
+                .filter(|via_snapshot| static_via_probe || payload_len <= via_snapshot.min_mtu)
+                .map(|_| via.to_owned())
+        })
+        .unwrap_or_else(|| tcp_target.clone());
 
     SptpsTransportTargets {
         udp_relay,
@@ -460,6 +603,17 @@ pub(crate) fn listen_socket_index_for(
 }
 
 impl RuntimeUdpPacketTransport<'_> {
+    fn active_meta_connection_index_for_peer(&self, peer: &str) -> Option<usize> {
+        self.meta_connections
+            .iter()
+            .position(|connection| connection.is_current_edge_connection_for_peer(peer))
+            .or_else(|| {
+                self.meta_connections
+                    .iter()
+                    .position(|connection| connection.can_carry_data_for_peer(peer))
+            })
+    }
+
     pub(crate) fn should_send_tcp_packet(&self, target: &str, packet: &VpnPacket) -> bool {
         packet.priority == -1
             || self.local_tcp_only
@@ -490,10 +644,8 @@ impl RuntimeUdpPacketTransport<'_> {
             .or_else(|| self.addresses.address(peer))
     }
 
-    pub(crate) fn has_active_meta_connection(&self, peer: &str) -> bool {
-        self.meta_connections
-            .iter()
-            .any(|connection| connection.active_name() == Some(peer))
+    pub(crate) fn has_authenticated_meta_connection(&self, peer: &str) -> bool {
+        self.active_meta_connection_index_for_peer(peer).is_some()
     }
 
     pub(crate) fn sptps_direct_needs_plain_tcp_fallback(
@@ -501,7 +653,7 @@ impl RuntimeUdpPacketTransport<'_> {
         owner: &str,
         packet: &VpnPacket,
     ) -> bool {
-        if !self.has_active_meta_connection(owner) {
+        if !self.has_authenticated_meta_connection(owner) {
             return false;
         }
 
@@ -552,22 +704,15 @@ impl RuntimeUdpPacketTransport<'_> {
         owner: &str,
         relay_hint: &str,
         payload_len: usize,
+        packet_type: u8,
     ) -> SptpsTransportTargets {
-        let relay_selection = self
-            .sptps_route_snapshots
-            .get(owner)
-            .and_then(|snapshot| snapshot.next_hop.as_deref())
-            .filter(|next_hop| *next_hop == relay_hint)
-            .map(|_| SptpsRelaySelection::PreferVia)
-            .unwrap_or(SptpsRelaySelection::HonorRoute);
-
         choose_sptps_transport_targets(
             self.local_name,
             &self.sptps_route_snapshots,
             owner,
             relay_hint,
             payload_len,
-            relay_selection,
+            packet_type == SPTPS_UDP_PROBE_TYPE,
         )
     }
 
@@ -578,13 +723,10 @@ impl RuntimeUdpPacketTransport<'_> {
         packet: &VpnPacket,
     ) -> Result<(), TransportError> {
         let datagram = self.packet_codec.encode_relayed(owner, packet)?;
-        let Some(connection) = self
-            .meta_connections
-            .iter_mut()
-            .find(|connection| connection.active_name() == Some(relay))
-        else {
+        let Some(index) = self.active_meta_connection_index_for_peer(relay) else {
             return Ok(());
         };
+        let connection = &mut self.meta_connections[index];
 
         if option_version(connection.options) >= 7 {
             if let Err(error) = send_sptps_tcp_packet_on_connection(
@@ -617,16 +759,13 @@ impl RuntimeUdpPacketTransport<'_> {
         target: &str,
         packet: &VpnPacket,
     ) -> Result<(), TransportError> {
-        let Some(connection) = self
-            .meta_connections
-            .iter_mut()
-            .find(|connection| connection.active_name() == Some(target))
-        else {
+        let Some(index) = self.active_meta_connection_index_for_peer(target) else {
             return Err(TransportError::Io(io::Error::new(
                 io::ErrorKind::NotConnected,
                 format!("no active meta connection to {target} for TCP packet fallback"),
             )));
         };
+        let connection = &mut self.meta_connections[index];
 
         if let Err(error) = send_plain_tcp_packet_on_connection(
             connection,
@@ -648,8 +787,7 @@ impl RuntimeUdpPacketTransport<'_> {
 
     pub(crate) fn legacy_peer_needs_tcp_fallback(&self, peer: &str) -> bool {
         self.legacy_key_snapshots.get(peer).is_some_and(|snapshot| {
-            self.is_runtime_legacy_peer(peer, snapshot)
-                && (!snapshot.valid_key || !snapshot.valid_key_in)
+            self.is_runtime_legacy_peer(peer, snapshot) && !snapshot.valid_key
         })
     }
 

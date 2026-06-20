@@ -1,6 +1,51 @@
 use crate::*;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RuntimeIoProgress {
+    Processed,
+    NotReady,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Default)]
+pub(crate) struct RuntimeUdpRecvBatch {
+    buffers: Vec<[u8; MAX_DATAGRAM_SIZE]>,
+    addrs: Vec<libc::sockaddr_storage>,
+}
+
+#[cfg(target_os = "linux")]
+impl RuntimeUdpRecvBatch {
+    fn ensure_capacity(&mut self, count: usize) {
+        while self.buffers.len() < count {
+            self.buffers.push([0u8; MAX_DATAGRAM_SIZE]);
+            self.addrs.push(unsafe { std::mem::zeroed() });
+        }
+    }
+
+    fn prepare(&mut self, count: usize) -> (Vec<libc::iovec>, Vec<libc::mmsghdr>) {
+        self.ensure_capacity(count);
+        let mut iovecs = Vec::with_capacity(count);
+        let mut messages = Vec::with_capacity(count);
+        for index in 0..count {
+            self.addrs[index] = unsafe { std::mem::zeroed() };
+            iovecs.push(libc::iovec {
+                iov_base: self.buffers[index].as_mut_ptr().cast(),
+                iov_len: MAX_DATAGRAM_SIZE,
+            });
+            let mut message: libc::mmsghdr = unsafe { std::mem::zeroed() };
+            message.msg_hdr.msg_name =
+                (&mut self.addrs[index] as *mut libc::sockaddr_storage).cast();
+            message.msg_hdr.msg_namelen =
+                std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+            message.msg_hdr.msg_iov = &mut iovecs[index];
+            message.msg_hdr.msg_iovlen = 1;
+            messages.push(message);
+        }
+        (iovecs, messages)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RuntimeListenSocketInfo {
     pub address: SocketAddr,
     pub bind_to: bool,
@@ -9,8 +54,12 @@ pub struct RuntimeListenSocketInfo {
 #[derive(Debug)]
 pub struct RuntimeDaemonState {
     pub(crate) listen_sockets: Vec<RuntimeListenSocket>,
+    #[cfg(target_os = "linux")]
+    pub(crate) udp_recv_batch: RuntimeUdpRecvBatch,
     pub(crate) meta_connections: Vec<RuntimeMetaConnection>,
     pub(crate) state: NetworkState,
+    pub(crate) runtime_config: RuntimeConfig,
+    pub(crate) local_edge_connections: BTreeMap<String, u64>,
     pub(crate) local_name: String,
     pub(crate) netname: Option<String>,
     pub(crate) local_port: String,
@@ -29,13 +78,19 @@ pub struct RuntimeDaemonState {
     pub(crate) max_outgoing_retry_timeout_secs: u64,
     pub(crate) outgoing_retry: BTreeMap<String, OutgoingRetryState>,
     pub(crate) autoconnect_outgoing: BTreeMap<String, OutgoingRetryState>,
+    pub(crate) outgoing_address_cursors: BTreeMap<String, usize>,
     pub(crate) max_connection_burst: u64,
     pub(crate) connection_burst: ConnectionBurstCounter,
     pub(crate) samehost_burst: ConnectionBurstCounter,
     pub(crate) previous_tarpit_peer: Option<IpAddr>,
     pub(crate) tarpit: VecDeque<TcpStream>,
+    pub(crate) topology_backoff: RuntimeTopologyBackoff,
+    pub(crate) next_tinc_periodic: Instant,
+    pub(crate) next_meta_ping_check: Instant,
     pub(crate) device_standby: bool,
     pub(crate) device_enabled: bool,
+    pub(crate) device_read_errors: u32,
+    pub(crate) device_read_backoff_until: Option<Instant>,
     pub(crate) ping_interval: Duration,
     pub(crate) ping_timeout: Duration,
     pub(crate) mac_expire: i32,
@@ -69,12 +124,12 @@ pub struct RuntimeDaemonState {
     pub(crate) engine_config: EngineConfig,
     pub(crate) device: RuntimeDevice,
     pub(crate) traffic: BTreeMap<String, TrafficCounters>,
-    pub(crate) pcap_packets: VecDeque<Vec<u8>>,
     pub(crate) pcap_subscribers: Vec<RuntimeControlPcapSubscriber>,
+    #[cfg(test)]
     pub(crate) log_entries: VecDeque<RuntimeLogEntry>,
     pub(crate) log_subscribers: Vec<RuntimeControlLogSubscriber>,
     pub(crate) log_sink: Option<RuntimeLogSink>,
-    pub(crate) upnp_log_receiver: Option<mpsc::Receiver<RuntimeLogEntry>>,
+    pub(crate) upnp_log_receiver: Option<RuntimeUpnpLogReceiver>,
     #[cfg(unix)]
     pub(crate) umbilical_log_sink: Option<RuntimeUmbilicalLogSink>,
     pub(crate) debug_level: i32,
@@ -84,8 +139,10 @@ pub struct RuntimeDaemonState {
     pub(crate) next_connection_id: u64,
     pub(crate) next_meta_nonce: u32,
     pub(crate) past_requests: PastRequestCache,
+    pub(crate) next_past_request_age: Option<Instant>,
     pub(crate) strict_forwarded_topology: VecDeque<MetaMessage>,
     pub(crate) packet_diag_counts: BTreeMap<String, u64>,
+    pub(crate) pending_close_reason: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -129,8 +186,12 @@ impl RuntimeDaemonState {
         }
         let mut state = Self {
             listen_sockets,
+            #[cfg(target_os = "linux")]
+            udp_recv_batch: RuntimeUdpRecvBatch::default(),
             meta_connections: Vec::new(),
             state: network_state,
+            runtime_config: config.clone(),
+            local_edge_connections: BTreeMap::new(),
             local_name: config.name.clone(),
             netname: None,
             local_port,
@@ -149,17 +210,23 @@ impl RuntimeDaemonState {
             max_outgoing_retry_timeout_secs: config.daemon.max_timeout as u64,
             outgoing_retry: BTreeMap::new(),
             autoconnect_outgoing: BTreeMap::new(),
+            outgoing_address_cursors: BTreeMap::new(),
             max_connection_burst: config.daemon.max_connection_burst as u64,
             connection_burst: ConnectionBurstCounter::new(Instant::now()),
             samehost_burst: ConnectionBurstCounter::new(Instant::now()),
             previous_tarpit_peer: None,
             tarpit: VecDeque::new(),
+            topology_backoff: RuntimeTopologyBackoff::default(),
+            next_tinc_periodic: now,
+            next_meta_ping_check: now + tinc_timer_jitter_duration(ping_timeout_duration(config)),
             device_standby: config.daemon.device_standby,
             device_enabled: !config.daemon.device_standby,
+            device_read_errors: 0,
+            device_read_backoff_until: None,
             ping_interval: Duration::from_secs(config.daemon.ping_interval.max(1) as u64),
             ping_timeout: Duration::from_secs(config.daemon.ping_timeout.max(1) as u64),
             mac_expire: config.daemon.mac_expire,
-            next_mac_subnet_age: now + MAC_SUBNET_AGE_INTERVAL,
+            next_mac_subnet_age: now + tinc_timer_jitter_duration(TINC_AGING_INTERVAL),
             mtu_info_interval: Duration::from_secs(config.daemon.mtu_info_interval.max(0) as u64),
             udp_info_interval: Duration::from_secs(config.daemon.udp_info_interval.max(0) as u64),
             local_discovery: config.daemon.local_discovery,
@@ -195,8 +262,8 @@ impl RuntimeDaemonState {
             engine_config: config.engine.clone(),
             device: RuntimeDevice::memory(),
             traffic: BTreeMap::new(),
-            pcap_packets: VecDeque::new(),
             pcap_subscribers: Vec::new(),
+            #[cfg(test)]
             log_entries: VecDeque::new(),
             log_subscribers: Vec::new(),
             log_sink: None,
@@ -210,8 +277,10 @@ impl RuntimeDaemonState {
             next_connection_id: 1,
             next_meta_nonce: random_meta_nonce_start(),
             past_requests: PastRequestCache::new(config.daemon.ping_interval.max(1) as u64),
+            next_past_request_age: None,
             strict_forwarded_topology: VecDeque::new(),
             packet_diag_counts: BTreeMap::new(),
+            pending_close_reason: None,
         };
         state.record_log_with_priority(
             0,
@@ -285,6 +354,27 @@ impl RuntimeDaemonState {
         self.device.push_read(packet)
     }
 
+    #[cfg(unix)]
+    pub(crate) fn device_poll_fd(&self) -> Option<RawFd> {
+        if self.device_enabled && !self.device_read_backoff_active(Instant::now()) {
+            self.device.poll_fd()
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn device_read_backoff_active(&self, now: Instant) -> bool {
+        self.device_read_backoff_until
+            .is_some_and(|deadline| now < deadline)
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn upnp_log_poll_fd(&self) -> Option<RawFd> {
+        self.upnp_log_receiver
+            .as_ref()
+            .and_then(RuntimeUpnpLogReceiver::poll_fd)
+    }
+
     pub fn set_debug_level(&mut self, level: i32) {
         self.debug_level = level;
     }
@@ -348,15 +438,17 @@ impl RuntimeDaemonState {
         message: impl Into<String>,
     ) {
         let message = message.into();
+        if level > self.debug_level && self.log_subscribers.is_empty() {
+            return;
+        }
+
         self.publish_control_log_entry(level, priority, &message);
 
         if level > self.debug_level {
             return;
         }
 
-        if self.log_entries.len() >= CONTROL_LOG_RING_CAPACITY {
-            self.log_entries.pop_front();
-        }
+        #[cfg(test)]
         self.log_entries.push_back(RuntimeLogEntry {
             level,
             priority,
@@ -377,35 +469,30 @@ impl RuntimeDaemonState {
         }
 
         let debug_level = self.debug_level;
-        self.log_subscribers.retain(|subscriber| {
+        for subscriber in &mut self.log_subscribers {
             if level > control_log_level(subscriber.level, debug_level) {
-                return true;
+                continue;
             }
 
             let pretty = format_pretty_log_entry(priority, message, subscriber.colorize);
             let bytes = pretty.as_bytes();
-            let payload = bytes[..bytes.len().min(LOG_CONTROL_BUFFER_SIZE)].to_vec();
-            match subscriber.sender.try_send(payload) {
-                Ok(()) => true,
-                Err(mpsc::TrySendError::Full(_)) | Err(mpsc::TrySendError::Disconnected(_)) => {
-                    false
-                }
-            }
-        });
+            let payload = &bytes[..bytes.len().min(LOG_CONTROL_BUFFER_SIZE)];
+            subscriber.writer.queue_payload(REQ_LOG, payload);
+        }
     }
 
     pub(crate) fn register_control_log_subscriber(
         &mut self,
         level: i32,
         colorize: bool,
-        stream: Box<dyn Write + Send>,
+        stream: RuntimeControlSubscriberStream,
     ) -> Result<(), TincdError> {
-        let (sender, receiver) = mpsc::sync_channel(CONTROL_SUBSCRIBER_QUEUE_CAPACITY);
-        spawn_control_payload_writer("tinc-control-log", stream, REQ_LOG, receiver)?;
+        let writer = RuntimeControlSubscriberWriter::new(self.next_control_subscriber_id(), stream)
+            .map_err(control_io)?;
         self.log_subscribers.push(RuntimeControlLogSubscriber {
             level: level.clamp(DEBUG_UNSET, DEBUG_SCARY_THINGS),
             colorize,
-            sender,
+            writer,
         });
         Ok(())
     }
@@ -413,13 +500,67 @@ impl RuntimeDaemonState {
     pub(crate) fn register_control_pcap_subscriber(
         &mut self,
         snaplen: usize,
-        stream: Box<dyn Write + Send>,
+        stream: RuntimeControlSubscriberStream,
     ) -> Result<(), TincdError> {
-        let (sender, receiver) = mpsc::sync_channel(CONTROL_SUBSCRIBER_QUEUE_CAPACITY);
-        spawn_control_payload_writer("tinc-control-pcap", stream, REQ_PCAP, receiver)?;
+        let writer = RuntimeControlSubscriberWriter::new(self.next_control_subscriber_id(), stream)
+            .map_err(control_io)?;
         self.pcap_subscribers
-            .push(RuntimeControlPcapSubscriber { snaplen, sender });
+            .push(RuntimeControlPcapSubscriber { snaplen, writer });
         Ok(())
+    }
+
+    pub(crate) fn next_control_subscriber_id(&mut self) -> u64 {
+        let id = self.next_connection_id;
+        self.next_connection_id = self.next_connection_id.wrapping_add(1);
+        id
+    }
+
+    pub(crate) fn control_subscriber_writers(
+        &self,
+    ) -> impl Iterator<Item = &RuntimeControlSubscriberWriter> {
+        self.log_subscribers
+            .iter()
+            .map(|subscriber| &subscriber.writer)
+            .chain(
+                self.pcap_subscribers
+                    .iter()
+                    .map(|subscriber| &subscriber.writer),
+            )
+    }
+
+    pub(crate) fn flush_control_subscriber_by_id(
+        &mut self,
+        id: u64,
+    ) -> Result<RuntimeIoProgress, TincdError> {
+        if let Some(index) = self
+            .log_subscribers
+            .iter()
+            .position(|subscriber| subscriber.writer.id == id)
+        {
+            return match self.log_subscribers[index].writer.flush_once() {
+                Ok(progress) => Ok(progress),
+                Err(_) => {
+                    self.log_subscribers.remove(index);
+                    Ok(RuntimeIoProgress::Processed)
+                }
+            };
+        }
+
+        if let Some(index) = self
+            .pcap_subscribers
+            .iter()
+            .position(|subscriber| subscriber.writer.id == id)
+        {
+            return match self.pcap_subscribers[index].writer.flush_once() {
+                Ok(progress) => Ok(progress),
+                Err(_) => {
+                    self.pcap_subscribers.remove(index);
+                    Ok(RuntimeIoProgress::Processed)
+                }
+            };
+        }
+
+        Ok(RuntimeIoProgress::NotReady)
     }
 
     pub(crate) fn reopen_logger(&mut self) {
@@ -437,26 +578,14 @@ impl RuntimeDaemonState {
         }
     }
 
-    pub(crate) fn control_log_entries(&self, max_level: i32, colorize: bool) -> Vec<String> {
+    #[cfg(test)]
+    pub(crate) fn test_log_entries(&self, max_level: i32, colorize: bool) -> Vec<String> {
         let max_level = control_log_level(max_level, self.debug_level);
 
         self.log_entries
             .iter()
             .filter(|entry| entry.level <= max_level)
             .map(|entry| format_pretty_log_entry(entry.priority, &entry.message, colorize))
-            .collect()
-    }
-
-    pub(crate) fn control_pcap_packets(&self, snaplen: usize) -> Vec<Vec<u8>> {
-        let limit = if snaplen == 0 {
-            PCAP_CONTROL_BUFFER_SIZE
-        } else {
-            snaplen.min(PCAP_CONTROL_BUFFER_SIZE)
-        };
-
-        self.pcap_packets
-            .iter()
-            .map(|packet| packet[..packet.len().min(limit)].to_vec())
             .collect()
     }
 
@@ -467,7 +596,6 @@ impl RuntimeDaemonState {
     }
 
     pub(crate) fn capture_control_pcap_packet(&mut self, packet: &VpnPacket) {
-        push_control_pcap_packet(&mut self.pcap_packets, &packet.data);
         publish_control_pcap_packet(&mut self.pcap_subscribers, &packet.data);
     }
 
@@ -509,10 +637,12 @@ impl RuntimeDaemonState {
         self.peer_meta_configs = config.peer_meta_configs.clone();
         self.fwmark = config.daemon.fwmark;
         self.max_outgoing_retry_timeout_secs = config.daemon.max_timeout as u64;
+        self.runtime_config = config.clone();
         self.sync_outgoing_retry_state(config);
         self.max_connection_burst = config.daemon.max_connection_burst as u64;
         self.ping_interval = Duration::from_secs(config.daemon.ping_interval.max(1) as u64);
         self.ping_timeout = Duration::from_secs(config.daemon.ping_timeout.max(1) as u64);
+        self.next_meta_ping_check = Instant::now() + tinc_timer_jitter_duration(self.ping_timeout);
         self.mac_expire = config.daemon.mac_expire;
         self.mtu_info_interval = Duration::from_secs(config.daemon.mtu_info_interval.max(0) as u64);
         self.udp_info_interval = Duration::from_secs(config.daemon.udp_info_interval.max(0) as u64);
@@ -544,12 +674,14 @@ impl RuntimeDaemonState {
         self.sync_reloaded_nodes(config);
         self.sync_reloaded_subnets(config);
         self.state.experimental = config.state.experimental;
-        self.state.recompute_routes_at(current_unix_secs());
+        let reachability = self.state.recompute_routes_at(current_unix_secs());
+        self.update_route_udp_endpoints_like_tinc(&reachability);
         *self.packet_codec.ids_mut() = NodeIdTable::from_network_state(&self.state);
 
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn poll_once(&mut self) -> Result<bool, TincdError> {
         let mut did_work = false;
         did_work |= self.drain_upnp_logs();
@@ -557,12 +689,113 @@ impl RuntimeDaemonState {
         did_work |= self.drain_device_packets()?;
         did_work |= self.drain_udp_datagrams()?;
         self.read_meta_connections()?;
-        self.flush_meta_outputs()?;
         self.expire_symmetric_keys()?;
         self.expire_dynamic_mac_subnets()?;
-        self.send_meta_keepalives()?;
-        self.flush_meta_outputs()?;
+        self.age_past_requests_like_tinc();
+        self.expire_udp_probe_timeouts_like_tinc();
+        self.run_meta_ping_timer_once_like_tinc()?;
         Ok(did_work)
+    }
+
+    pub(crate) fn run_timers_once_with_periodic(
+        &mut self,
+        config: Option<&RuntimeConfig>,
+    ) -> Result<usize, TincdError> {
+        let autoconnected = self.run_tinc_periodic_once(config)?;
+        self.expire_symmetric_keys()?;
+        self.expire_dynamic_mac_subnets()?;
+        self.age_past_requests_like_tinc();
+        self.expire_udp_probe_timeouts_like_tinc();
+        self.run_meta_ping_timer_once_like_tinc()?;
+        Ok(autoconnected)
+    }
+
+    pub(crate) fn run_tinc_periodic_once(
+        &mut self,
+        config: Option<&RuntimeConfig>,
+    ) -> Result<usize, TincdError> {
+        let now = Instant::now();
+        let mut autoconnected = 0;
+        if now >= self.next_tinc_periodic {
+            self.apply_topology_backoff_periodic_check(now);
+            if let Some(config) = config
+                && config.autoconnect
+                && self.state.graph.nodes().count() > 1
+            {
+                autoconnected = self.do_autoconnect_like_tinc(config)?;
+            }
+            self.next_tinc_periodic = now + tinc_timer_jitter_duration(AUTOCONNECT_INTERVAL);
+        }
+        Ok(autoconnected)
+    }
+
+    pub(crate) fn apply_topology_backoff_periodic_check(&mut self, now: Instant) {
+        if let Some(delay) = self.topology_backoff.apply_periodic_check(now) {
+            self.record_log_with_priority(
+                0,
+                LOG_WARNING,
+                format!(
+                    "Possible node with same Name as us! Sleeping {} seconds.",
+                    delay.as_secs()
+                ),
+            );
+        }
+    }
+
+    pub(crate) fn run_meta_ping_timer_once_like_tinc(&mut self) -> Result<(), TincdError> {
+        let now = Instant::now();
+        if now < self.next_meta_ping_check {
+            return Ok(());
+        }
+        self.send_meta_keepalives_at(now)?;
+        self.next_meta_ping_check = now + tinc_timer_jitter_duration(Duration::from_secs(1));
+        Ok(())
+    }
+
+    pub(crate) fn age_past_requests_like_tinc(&mut self) {
+        self.age_past_requests_at_like_tinc(Instant::now(), current_unix_secs().max(0) as u64);
+    }
+
+    pub(crate) fn age_past_requests_at_like_tinc(&mut self, now: Instant, now_secs: u64) {
+        let Some(deadline) = self.next_past_request_age else {
+            return;
+        };
+        if now < deadline {
+            return;
+        }
+
+        let deleted = self.past_requests.age(now_secs);
+        let left = self.past_requests.len();
+        if left > 0 || deleted > 0 {
+            self.record_log_with_priority(
+                DEBUG_SCARY_THINGS,
+                LOG_DEBUG,
+                format!("Aging past requests: deleted {deleted}, left {left}"),
+            );
+        }
+        self.next_past_request_age = if self.past_requests.is_empty() {
+            None
+        } else {
+            Some(now + tinc_timer_jitter_duration(TINC_AGING_INTERVAL))
+        };
+    }
+
+    pub(crate) fn expire_udp_probe_timeouts_like_tinc(&mut self) {
+        let now = Instant::now();
+        let peers = self
+            .udp_probe
+            .iter()
+            .filter_map(|(peer, state)| {
+                state
+                    .udp_ping_timeout
+                    .is_some_and(|timeout| now >= timeout)
+                    .then(|| peer.clone())
+            })
+            .collect::<Vec<_>>();
+
+        for peer in peers {
+            self.expire_udp_probe_timeout(&peer, now);
+        }
     }
 
     pub(crate) fn drain_upnp_logs(&mut self) -> bool {
@@ -572,7 +805,7 @@ impl RuntimeDaemonState {
         let mut entries = Vec::new();
         let mut disconnected = false;
         loop {
-            match receiver.try_recv() {
+            match receiver.receiver.try_recv() {
                 Ok(entry) => entries.push(entry),
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => {
@@ -581,6 +814,7 @@ impl RuntimeDaemonState {
                 }
             }
         }
+        receiver.drain_wake();
         if !disconnected {
             self.upnp_log_receiver = Some(receiver);
         }
@@ -600,7 +834,6 @@ impl RuntimeDaemonState {
 
         for peer in &config.connect_to {
             if self.has_meta_connection_with_name(peer) {
-                self.mark_outgoing_connected(peer, now);
                 continue;
             }
 
@@ -624,10 +857,6 @@ impl RuntimeDaemonState {
 
         let active_connections = self.active_edge_connection_count_like_tinc();
         if active_connections < 3 {
-            let retried = self.retry_autoconnect_outgoing_like_tinc(config)?;
-            if retried > 0 {
-                return Ok(retried);
-            }
             return self.make_new_autoconnect_connection_like_tinc(config);
         }
 
@@ -669,7 +898,7 @@ impl RuntimeDaemonState {
         let (index, peer) = candidates[prng_below(candidates.len())].clone();
         self.record_log_with_priority(1, LOG_INFO, format!("Autodisconnecting from {peer}"));
         self.autoconnect_outgoing.remove(&peer);
-        self.close_meta_connection(index)?;
+        self.close_meta_connection_for_reason(index, "autoconnect-superfluous")?;
         Ok(true)
     }
 
@@ -701,12 +930,17 @@ impl RuntimeDaemonState {
         &mut self,
         config: &RuntimeConfig,
     ) -> Result<usize, TincdError> {
+        if !config.autoconnect {
+            return Ok(0);
+        }
+
         let now = Instant::now();
         let peers = self
             .autoconnect_outgoing
             .iter()
             .filter(|(peer, retry)| {
-                retry.next_attempt <= now && !self.has_meta_connection_with_name(peer)
+                retry.next_attempt <= now
+                    && !self.has_pending_or_authenticated_meta_connection_with_name(peer)
             })
             .map(|(peer, _)| peer.clone())
             .collect::<Vec<_>>();
@@ -743,7 +977,7 @@ impl RuntimeDaemonState {
             .graph
             .nodes()
             .filter(|node| node.name != self.local_name)
-            .filter(|node| !self.has_meta_connection_with_name(&node.name))
+            .filter(|node| !self.has_pending_or_authenticated_meta_connection_with_name(&node.name))
             .filter(|node| node.status.has_address || node.status.reachable)
             .map(|node| node.name.clone())
             .collect::<Vec<_>>();
@@ -798,7 +1032,7 @@ impl RuntimeDaemonState {
             return Ok(0);
         };
         if peer == self.local_name
-            || self.has_meta_connection_with_name(&peer)
+            || self.has_pending_or_authenticated_meta_connection_with_name(&peer)
             || node.status.reachable
             || !node.status.has_address
         {
@@ -821,21 +1055,28 @@ impl RuntimeDaemonState {
     }
 
     pub fn connect_peer(&mut self, config: &RuntimeConfig, peer: &str) -> Result<bool, TincdError> {
-        if self.has_meta_connection_with_name(peer) {
+        if self.has_pending_or_authenticated_meta_connection_with_name(peer) {
             return Ok(true);
         }
 
-        for address in self.outgoing_address_candidates_like_tinc(config, peer) {
+        let candidates = self.outgoing_address_candidates_like_tinc(config, peer);
+        let mut cursor = self.outgoing_address_cursors.remove(peer).unwrap_or(0);
+        while cursor < candidates.len() {
+            let address = candidates[cursor];
+            cursor += 1;
             if self.connect_peer_to_address(
                 peer,
                 address,
                 config.daemon.fwmark,
                 config.daemon.bind_to_interface.as_deref(),
             )? {
+                self.outgoing_address_cursors
+                    .insert(peer.to_owned(), cursor);
                 return Ok(true);
             }
         }
 
+        self.outgoing_address_cursors.remove(peer);
         Ok(false)
     }
 
@@ -892,7 +1133,6 @@ impl RuntimeDaemonState {
 
         for peer in &config.connect_to {
             if self.has_meta_connection_with_name(peer) {
-                self.mark_outgoing_connected(peer, now);
                 continue;
             }
 
@@ -1012,6 +1252,7 @@ impl RuntimeDaemonState {
     }
 
     pub(crate) fn add_recent_meta_address_like_tinc(&mut self, peer: &str, address: SocketAddr) {
+        self.outgoing_address_cursors.remove(peer);
         let mut addresses = self.read_address_cache(peer);
         promote_recent_address(&mut addresses, address);
         self.write_address_cache(peer, &addresses);
@@ -1023,6 +1264,7 @@ impl RuntimeDaemonState {
         peer: &str,
         address: SocketAddr,
     ) {
+        self.outgoing_address_cursors.remove(peer);
         let mut addresses = self.read_address_cache(peer);
         promote_recent_address(&mut addresses, address);
         self.write_address_cache(peer, &addresses);
@@ -1045,13 +1287,10 @@ impl RuntimeDaemonState {
 
     pub(crate) fn handle_pong_address_cache_like_tinc(&mut self, index: usize) {
         let Some((peer, address)) = self.meta_connections.get(index).and_then(|connection| {
-            if connection.is_outgoing() {
-                connection
-                    .active_name()
-                    .map(|name| (name.to_owned(), connection.peer))
-            } else {
-                None
-            }
+            connection
+                .outgoing_peer
+                .as_ref()
+                .map(|peer| (peer.clone(), connection.peer))
         }) else {
             return;
         };
@@ -1160,30 +1399,28 @@ impl RuntimeDaemonState {
                 return Ok(false);
             }
         };
-        let (mut stream, local, proxy_state, proxy_request, exec_proxy) = match proxy_target {
+        let (stream, local, connecting, proxy_state, proxy_request, exec_proxy) = match proxy_target
+        {
             OutgoingProxyTarget::Tcp {
                 address: connect_address,
                 handshake,
                 request,
             } => {
                 let bind_address = self.outgoing_bind_address_for(connect_address);
-                let Ok(stream) = connect_tcp_stream(
-                    connect_address,
-                    OUTGOING_CONNECT_TIMEOUT,
-                    fwmark,
-                    bind_to_interface,
-                    bind_address,
-                ) else {
+                let Ok((stream, connecting)) =
+                    connect_tcp_stream(connect_address, fwmark, bind_to_interface, bind_address)
+                else {
                     return Ok(false);
                 };
                 let local = stream.local_addr().unwrap_or(connect_address);
-                (stream, local, handshake, request, None)
+                (stream, local, connecting, handshake, request, None)
             }
             OutgoingProxyTarget::Exec { stream, child } => {
                 let local = stream.local_addr().unwrap_or(address);
                 (
                     stream,
                     local,
+                    false,
                     ProxyHandshake::None,
                     None,
                     Some(RuntimeExecProxyChild::new(child)),
@@ -1191,37 +1428,35 @@ impl RuntimeDaemonState {
             }
         };
 
-        let mut bytes_written = 0u64;
+        let mut outbound = Vec::new();
         if let Some(proxy_request) = proxy_request {
-            if stream.write_all(&proxy_request).is_err() {
-                return Ok(false);
-            }
-            bytes_written += proxy_request.len() as u64;
+            outbound.extend_from_slice(&proxy_request);
         }
-        let initial_id = driver.initial_id_bytes();
-        if stream.write_all(&initial_id).is_err() {
-            return Ok(false);
-        }
-        bytes_written += initial_id.len() as u64;
+        outbound.extend_from_slice(&driver.initial_id_bytes());
         if stream.set_nonblocking(true).is_err() {
             return Ok(false);
         }
 
+        let now = Instant::now();
         self.meta_connections.push(RuntimeMetaConnection {
             id: self.next_connection_id,
             stream,
             peer: address,
             local,
             bytes_read: 0,
-            bytes_written,
+            bytes_written: 0,
             outbound: Vec::new(),
             outbound_offset: 0,
             status: CONNECTION_STATUS_ACTIVE,
             options: 0,
+            outgoing_peer: Some(peer.to_owned()),
             outgoing_autoconnect: false,
+            connecting,
             close_requested: false,
-            last_activity: Instant::now(),
+            last_activity: now,
+            last_ping_time: now,
             last_ping_sent: None,
+            edge_peer: None,
             exec_proxy,
             kind: RuntimeMetaConnectionKind::Active {
                 driver,
@@ -1230,6 +1465,14 @@ impl RuntimeDaemonState {
             },
         });
         self.next_connection_id = self.next_connection_id.wrapping_add(1);
+
+        if let Some(connection) = self.meta_connections.last_mut() {
+            queue_meta_chunk(connection, &outbound);
+            if !connection.connecting && connection.flush_meta_output().is_err() {
+                self.meta_connections.pop();
+                return Ok(false);
+            }
+        }
 
         Ok(true)
     }
@@ -1252,61 +1495,77 @@ impl RuntimeDaemonState {
         Some(bind)
     }
 
+    #[cfg(test)]
     pub(crate) fn accept_meta_connections(&mut self) -> Result<(), TincdError> {
-        let fwmark = self.fwmark;
         for index in 0..self.listen_sockets.len() {
             loop {
-                match self.listen_sockets[index].tcp.accept() {
-                    Ok((stream, peer)) => {
-                        if self.should_tarpit_meta_connection(peer, Instant::now()) {
-                            self.tarpit_meta_connection(stream);
-                            continue;
-                        }
-                        if let Err(error) = configure_tcp_stream(&stream, fwmark) {
-                            self.record_log_with_priority(
-                                0,
-                                LOG_ERR,
-                                format!("Could not configure meta connection: {error}"),
-                            );
-                            continue;
-                        }
-                        let local = stream
-                            .local_addr()
-                            .unwrap_or(self.listen_sockets[index].address);
-                        self.meta_connections.push(RuntimeMetaConnection {
-                            id: self.next_connection_id,
-                            stream,
-                            peer,
-                            local,
-                            bytes_read: 0,
-                            bytes_written: 0,
-                            outbound: Vec::new(),
-                            outbound_offset: 0,
-                            status: CONNECTION_STATUS_PENDING,
-                            options: 0,
-                            outgoing_autoconnect: false,
-                            close_requested: false,
-                            last_activity: Instant::now(),
-                            last_ping_sent: None,
-                            exec_proxy: None,
-                            kind: RuntimeMetaConnectionKind::PendingIncoming { buffer: Vec::new() },
-                        });
-                        self.next_connection_id = self.next_connection_id.wrapping_add(1);
-                    }
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
-                    Err(error) => {
-                        self.record_log_with_priority(
-                            0,
-                            LOG_ERR,
-                            format!("Accepting a new connection failed: {error}"),
-                        );
-                        break;
-                    }
+                if !self.accept_meta_connection_once(index)? {
+                    break;
                 }
             }
         }
 
         Ok(())
+    }
+
+    pub(crate) fn accept_meta_connection_once(&mut self, index: usize) -> Result<bool, TincdError> {
+        let Some(listener) = self.listen_sockets.get(index) else {
+            return Ok(false);
+        };
+        let fwmark = self.fwmark;
+        let default_local = listener.address;
+
+        match listener.tcp.accept() {
+            Ok((stream, peer)) => {
+                if self.should_tarpit_meta_connection(peer, Instant::now()) {
+                    self.tarpit_meta_connection(stream);
+                    return Ok(true);
+                }
+                if let Err(error) = configure_tcp_stream(&stream, fwmark) {
+                    self.record_log_with_priority(
+                        0,
+                        LOG_ERR,
+                        format!("Could not configure meta connection: {error}"),
+                    );
+                    return Ok(true);
+                }
+                let local = stream.local_addr().unwrap_or(default_local);
+                let now = Instant::now();
+                self.meta_connections.push(RuntimeMetaConnection {
+                    id: self.next_connection_id,
+                    stream,
+                    peer,
+                    local,
+                    bytes_read: 0,
+                    bytes_written: 0,
+                    outbound: Vec::new(),
+                    outbound_offset: 0,
+                    status: CONNECTION_STATUS_PENDING,
+                    options: 0,
+                    outgoing_peer: None,
+                    outgoing_autoconnect: false,
+                    connecting: false,
+                    close_requested: false,
+                    last_activity: now,
+                    last_ping_time: now,
+                    last_ping_sent: None,
+                    edge_peer: None,
+                    exec_proxy: None,
+                    kind: RuntimeMetaConnectionKind::PendingIncoming { buffer: Vec::new() },
+                });
+                self.next_connection_id = self.next_connection_id.wrapping_add(1);
+                Ok(true)
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(false),
+            Err(error) => {
+                self.record_log_with_priority(
+                    0,
+                    LOG_ERR,
+                    format!("Accepting a new connection failed: {error}"),
+                );
+                Ok(false)
+            }
+        }
     }
 
     pub(crate) fn should_tarpit_meta_connection(&mut self, peer: SocketAddr, now: Instant) -> bool {
@@ -1430,7 +1689,27 @@ impl RuntimeDaemonState {
         Ok(())
     }
 
+    pub(crate) fn handle_legacy_nested_tx_targets_like_tinc(
+        &mut self,
+        targets: Vec<String>,
+    ) -> Result<(), TincdError> {
+        for target in targets {
+            self.try_tx_like_tinc(&target, true)?;
+        }
+
+        Ok(())
+    }
+
     pub(crate) fn sptps_req_key_due(&self, peer: &str) -> bool {
+        if self
+            .state
+            .graph
+            .node(peer)
+            .is_some_and(|node| !node.status.waiting_for_key)
+        {
+            return true;
+        }
+
         self.sptps_last_req_key
             .get(peer)
             .is_none_or(|sent| sent.elapsed() > SPTPS_REQ_KEY_INTERVAL)
@@ -1443,10 +1722,16 @@ impl RuntimeDaemonState {
     }
 
     pub(crate) fn restart_pending_sptps_key_exchange(&mut self, peer: &str) {
-        let Some(sent) = self.sptps_last_req_key.get(peer).copied() else {
-            return;
-        };
-        if sent.elapsed() <= SPTPS_REQ_KEY_INTERVAL {
+        let waiting_for_key = self
+            .state
+            .graph
+            .node(peer)
+            .is_some_and(|node| node.status.waiting_for_key);
+        let recently_requested = self
+            .sptps_last_req_key
+            .get(peer)
+            .is_some_and(|sent| sent.elapsed() <= SPTPS_REQ_KEY_INTERVAL);
+        if waiting_for_key && recently_requested {
             return;
         }
 
@@ -1459,26 +1744,31 @@ impl RuntimeDaemonState {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn drain_device_packets(&mut self) -> Result<bool, TincdError> {
         let mut did_work = false;
 
-        for _ in 0..DEVICE_DRAIN_BUDGET {
+        loop {
             if !self.poll_device_packet()? {
                 return Ok(did_work);
             }
             did_work = true;
         }
-
-        Ok(did_work)
     }
 
     pub(crate) fn poll_device_packet(&mut self) -> Result<bool, TincdError> {
-        let Some(packet) = self
-            .device
-            .read_packet()
-            .map_err(|error| TincdError::RuntimeState(format!("device read error: {error}")))?
-        else {
+        if self.device_read_backoff_active(Instant::now()) {
             return Ok(false);
+        }
+
+        let packet = match self.device.read_packet() {
+            Ok(Some(packet)) => {
+                self.device_read_errors = 0;
+                self.device_read_backoff_until = None;
+                packet
+            }
+            Ok(None) => return Ok(false),
+            Err(error) => return self.handle_device_read_error_like_tinc(error),
         };
         let peer_options = self.peer_options_snapshot();
         let udp_target_snapshots = self.udp_target_snapshot();
@@ -1487,6 +1777,7 @@ impl RuntimeDaemonState {
         let mut legacy_key_actions = Vec::new();
         let mut sptps_key_actions = Vec::new();
         let mut mtu_reductions = Vec::new();
+        let mut legacy_nested_tx_targets = Vec::new();
         let mut transport = RuntimeUdpPacketTransport {
             local_name: &self.local_name,
             sockets: &self.listen_sockets,
@@ -1508,8 +1799,8 @@ impl RuntimeDaemonState {
             legacy_key_actions: &mut legacy_key_actions,
             sptps_key_actions: &mut sptps_key_actions,
             mtu_reductions: &mut mtu_reductions,
+            legacy_nested_tx_targets: &mut legacy_nested_tx_targets,
             traffic: &mut self.traffic,
-            pcap_packets: &mut self.pcap_packets,
             pcap_subscribers: &mut self.pcap_subscribers,
             priority_inheritance: self.engine_config.route.priority_inheritance,
         };
@@ -1528,9 +1819,43 @@ impl RuntimeDaemonState {
         self.handle_legacy_key_actions(legacy_key_actions)?;
         self.handle_sptps_key_actions(sptps_key_actions)?;
         self.apply_mtu_reductions(mtu_reductions);
+        self.handle_legacy_nested_tx_targets_like_tinc(legacy_nested_tx_targets)?;
         self.handle_engine_events(events)?;
 
         Ok(true)
+    }
+
+    pub(crate) fn handle_device_read_error_like_tinc(
+        &mut self,
+        error: DeviceError,
+    ) -> Result<bool, TincdError> {
+        let device = self.device.info().device.clone();
+        let delay = DEVICE_READ_ERROR_BACKOFF_STEP * self.device_read_errors;
+        if !delay.is_zero() {
+            self.device_read_backoff_until = Some(Instant::now() + delay);
+        } else {
+            self.device_read_backoff_until = None;
+        }
+        self.device_read_errors = self.device_read_errors.saturating_add(1);
+
+        self.record_log_with_priority(
+            0,
+            LOG_ERR,
+            format!("Error while reading from {device}: {error}"),
+        );
+
+        if self.device_read_errors > DEVICE_READ_ERROR_LIMIT {
+            self.record_log_with_priority(
+                0,
+                LOG_ERR,
+                format!("Too many errors from {device}, exiting!"),
+            );
+            return Err(TincdError::RuntimeState(format!(
+                "Too many errors from {device}, exiting!"
+            )));
+        }
+
+        Ok(false)
     }
 
     pub(crate) fn handle_engine_events(
@@ -1572,13 +1897,14 @@ impl RuntimeDaemonState {
                     target,
                     packet,
                     forced_tcp,
+                    reason,
                 } => {
                     self.record_packet_diag(
                         format!("transport-deferred:{owner}:{target}"),
                         |count| {
                             let summary = packet_summary(&packet);
                             format!(
-                                "diag transport-deferred owner={owner} target={target} count={count} {summary}"
+                                "diag transport-deferred owner={owner} target={target} count={count} reason={reason} {summary}"
                             )
                         },
                     );
@@ -1612,6 +1938,10 @@ impl RuntimeDaemonState {
         key: impl Borrow<str>,
         message: impl FnOnce(u64) -> String,
     ) {
+        if !self.packet_diag_enabled() {
+            return;
+        }
+
         let count = {
             let key = key.borrow();
             if let Some(count) = self.packet_diag_counts.get_mut(key) {
@@ -1625,9 +1955,15 @@ impl RuntimeDaemonState {
 
         if count <= 8 || count.is_power_of_two() {
             let message = message(count);
-            eprintln!("{message}");
-            self.record_log_with_priority(0, LOG_DEBUG, message);
+            self.record_log_with_priority(DEBUG_TRAFFIC, LOG_DEBUG, message);
         }
+    }
+
+    fn packet_diag_enabled(&self) -> bool {
+        DEBUG_TRAFFIC <= self.debug_level
+            || self.log_subscribers.iter().any(|subscriber| {
+                DEBUG_TRAFFIC <= control_log_level(subscriber.level, self.debug_level)
+            })
     }
 
     pub(crate) fn handle_meta_tcp_packet(
@@ -1684,7 +2020,6 @@ impl RuntimeDaemonState {
                 return Ok(());
             };
             let destination_reachable = destination_node.status.reachable;
-            let destination_valid_key = destination_node.status.valid_key;
             let destination_via = destination_node.route.via.clone();
 
             if !destination_reachable {
@@ -1696,11 +2031,7 @@ impl RuntimeDaemonState {
                 self.send_udp_info(&local_name, &source)?;
             }
 
-            if destination_valid_key {
-                self.forward_sptps_tcp_payload(&destination, &source, &payload)?;
-            } else {
-                self.try_tx_after_packet_send_like_tinc(&destination, &destination, true, false)?;
-            }
+            self.forward_sptps_tcp_payload(&destination, &source, &payload)?;
 
             return Ok(());
         }
@@ -1746,6 +2077,7 @@ impl RuntimeDaemonState {
         let mut legacy_key_actions = Vec::new();
         let mut sptps_key_actions = Vec::new();
         let mut mtu_reductions = Vec::new();
+        let mut legacy_nested_tx_targets = Vec::new();
         let mut transport = RuntimeUdpPacketTransport {
             local_name: &self.local_name,
             sockets: &self.listen_sockets,
@@ -1767,8 +2099,8 @@ impl RuntimeDaemonState {
             legacy_key_actions: &mut legacy_key_actions,
             sptps_key_actions: &mut sptps_key_actions,
             mtu_reductions: &mut mtu_reductions,
+            legacy_nested_tx_targets: &mut legacy_nested_tx_targets,
             traffic: &mut self.traffic,
-            pcap_packets: &mut self.pcap_packets,
             pcap_subscribers: &mut self.pcap_subscribers,
             priority_inheritance: self.engine_config.route.priority_inheritance,
         };
@@ -1785,199 +2117,264 @@ impl RuntimeDaemonState {
         self.handle_legacy_key_actions(legacy_key_actions)?;
         self.handle_sptps_key_actions(sptps_key_actions)?;
         self.apply_mtu_reductions(mtu_reductions);
+        self.handle_legacy_nested_tx_targets_like_tinc(legacy_nested_tx_targets)?;
         self.handle_engine_events(events)
     }
 
+    #[cfg(test)]
     pub(crate) fn drain_udp_datagrams(&mut self) -> Result<bool, TincdError> {
         let mut did_work = false;
-        let mut buffer = [0u8; 2048];
 
         for index in 0..self.listen_sockets.len() {
-            for _ in 0..UDP_DRAIN_BUDGET_PER_SOCKET {
-                match self.listen_sockets[index].udp.recv_from(&mut buffer) {
-                    Ok((len, peer)) => {
-                        did_work = true;
-                        let source = if let Some(source) = self.udp_source_node(peer) {
-                            source
-                        } else {
-                            match self
-                                .packet_codec
-                                .verify_direct_datagram_source(&buffer[..len])
-                            {
-                                Ok(Some(source)) => source.to_owned(),
-                                Ok(None) | Err(_) => {
-                                    match self.legacy_udp_try_harder(peer, &buffer[..len]) {
-                                        Some(source) => source,
-                                        None => continue,
-                                    }
-                                }
-                            }
-                        };
-                        self.udp_socket_by_peer.insert(source.clone(), index);
-                        if self.handle_sptps_udp_envelope(&source, peer, index, &buffer[..len])? {
-                            continue;
-                        }
-                        let packet = if let Some(session) = self.packet_codec.peer(&source) {
-                            let expected = session.packet_type();
-                            let record = match self
-                                .packet_codec
-                                .decode_record(&source, &buffer[..len])
-                            {
-                                Ok(record) => record,
-                                Err(error) => {
-                                    self.record_packet_diag(
-                                            format!("udp-drop:sptps-decode:{source}"),
-                                            |count| {
-                                                format!(
-                                                    "diag udp-drop source={source} peer={peer} count={count} reason=sptps-decode error={error} len={len}"
-                                                )
-                                            },
-                                        );
-                                    continue;
-                                }
-                            };
-                            if record.record_type == SPTPS_UDP_PROBE_TYPE {
-                                self.note_udp_recent_len(&source, record.payload.len());
-                                self.handle_udp_probe_payload(
-                                    &source,
-                                    peer,
-                                    index,
-                                    &record.payload,
-                                    true,
-                                )?;
-                                self.update_node_udp_like_tinc(&source, peer, index);
-                                continue;
-                            }
-                            if record.record_type != expected {
-                                self.record_packet_diag(
-                                    format!("udp-drop:sptps-type:{source}"),
-                                    |count| {
-                                        format!(
-                                            "diag udp-drop source={source} peer={peer} count={count} reason=sptps-type actual={} expected={} payload_len={}",
-                                            record.record_type,
-                                            expected,
-                                            record.payload.len()
-                                        )
-                                    },
-                                );
-                                continue;
-                            }
-                            match sptps_packet_from_payload(record.record_type, record.payload) {
-                                Ok(packet) => packet,
-                                Err(error) => {
-                                    self.record_packet_diag(
-                                        format!("udp-drop:sptps-packet:{source}"),
-                                        |count| {
-                                            format!(
-                                                "diag udp-drop source={source} peer={peer} count={count} reason=sptps-packet error={error}"
-                                            )
-                                        },
-                                    );
-                                    continue;
-                                }
-                            }
-                        } else if self.legacy_codec.peer(&source).is_some() {
-                            match self.legacy_codec.decode(&source, &buffer[..len]) {
-                                Ok(packet) => packet,
-                                Err(error) => {
-                                    self.record_packet_diag(
-                                        format!("udp-drop:legacy-decode:{source}"),
-                                        |count| {
-                                            format!(
-                                                "diag udp-drop source={source} peer={peer} count={count} reason=legacy-decode error={error} len={len}"
-                                            )
-                                        },
-                                    );
-                                    continue;
-                                }
-                            }
-                        } else {
-                            self.request_sptps_key_after_unkeyed_udp_like_tinc(
-                                &source,
-                                &buffer[..len],
-                            )?;
-                            self.record_packet_diag(
-                                format!("udp-drop:no-key:{source}"),
-                                |count| {
-                                    format!(
-                                        "diag udp-drop source={source} peer={peer} count={count} reason=no-key len={len}"
-                                    )
-                                },
-                            );
-                            continue;
-                        };
-                        self.note_udp_recent_len(&source, packet.len());
-                        if is_udp_probe_payload(&packet.data) {
-                            let secure_udp = self.packet_codec.peer(&source).is_some()
-                                || self.legacy_codec.peer(&source).is_some();
-                            self.handle_udp_probe_payload(
-                                &source,
-                                peer,
-                                index,
-                                &packet.data,
-                                secure_udp,
-                            )?;
-                            self.update_node_udp_like_tinc(&source, peer, index);
-                            continue;
-                        }
-                        self.record_inbound_traffic(&source, packet.len());
-                        self.capture_control_pcap_packet(&packet);
-                        let peer_options = self.peer_options_snapshot();
-                        let udp_target_snapshots = self.udp_target_snapshot();
-                        let sptps_route_snapshots = self.sptps_route_snapshot();
-                        let legacy_key_snapshots = self.legacy_key_snapshot();
-                        let mut legacy_key_actions = Vec::new();
-                        let mut sptps_key_actions = Vec::new();
-                        let mut mtu_reductions = Vec::new();
-                        let mut transport = RuntimeUdpPacketTransport {
-                            local_name: &self.local_name,
-                            sockets: &self.listen_sockets,
-                            addresses: &self.addresses,
-                            udp_socket_by_peer: &self.udp_socket_by_peer,
-                            modern_peer_keys: &self.keys.peer_public_keys,
-                            meta_connections: &mut self.meta_connections,
-                            experimental: self.state.experimental,
-                            local_tcp_only: self.local_tcp_only,
-                            max_output_buffer_size: self.max_output_buffer_size,
-                            peer_options,
-                            packet_codec: &mut self.packet_codec,
-                            legacy_codec: &mut self.legacy_codec,
-                            udp_target_snapshots,
-                            udp_unconfirmed_guess_counter: &mut self.udp_unconfirmed_guess_counter,
-                            sptps_route_snapshots,
-                            legacy_key_snapshots,
-                            legacy_last_req_key: &mut self.legacy_last_req_key,
-                            legacy_key_actions: &mut legacy_key_actions,
-                            sptps_key_actions: &mut sptps_key_actions,
-                            mtu_reductions: &mut mtu_reductions,
-                            traffic: &mut self.traffic,
-                            pcap_packets: &mut self.pcap_packets,
-                            pcap_subscribers: &mut self.pcap_subscribers,
-                            priority_inheritance: self.engine_config.route.priority_inheritance,
-                        };
-
-                        let events = handle_network_packet_with(
-                            &mut self.state,
-                            &mut self.device,
-                            &mut transport,
-                            &self.engine_config,
-                            &source,
-                            packet,
-                        )
-                        .map_err(engine_error)?;
-                        self.handle_legacy_key_actions(legacy_key_actions)?;
-                        self.handle_sptps_key_actions(sptps_key_actions)?;
-                        self.apply_mtu_reductions(mtu_reductions);
-                        self.handle_engine_events(events)?;
-                        self.update_node_udp_like_tinc(&source, peer, index);
-                    }
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
-                    Err(error) => return Err(listen_io(error)),
-                }
+            while self.read_udp_datagram_once(index)? {
+                did_work = true;
             }
         }
 
         Ok(did_work)
+    }
+
+    #[cfg(any(test, not(target_os = "linux")))]
+    pub(crate) fn read_udp_datagram_once(&mut self, index: usize) -> Result<bool, TincdError> {
+        let Some(socket) = self.listen_sockets.get(index) else {
+            return Ok(false);
+        };
+        let mut buffer = vec![0u8; MAX_DATAGRAM_SIZE];
+        let (len, peer) = match socket.udp.recv_from(&mut buffer) {
+            Ok(received) => received,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(false),
+            Err(error) => return Err(listen_io(error)),
+        };
+
+        self.handle_udp_datagram(index, peer, &buffer[..len])?;
+        Ok(true)
+    }
+
+    pub(crate) fn read_udp_datagrams_once(
+        &mut self,
+        index: usize,
+        limit: usize,
+    ) -> Result<usize, TincdError> {
+        if limit == 0 || self.listen_sockets.get(index).is_none() {
+            return Ok(0);
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            self.read_udp_datagrams_recvmmsg(index, limit)
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            let mut read = 0usize;
+            while read < limit && self.read_udp_datagram_once(index)? {
+                read += 1;
+            }
+            Ok(read)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn read_udp_datagrams_recvmmsg(
+        &mut self,
+        index: usize,
+        limit: usize,
+    ) -> Result<usize, TincdError> {
+        let Some(socket) = self.listen_sockets.get(index) else {
+            return Ok(0);
+        };
+        let fd = socket.udp.as_raw_fd();
+        let count = limit.min(u32::MAX as usize);
+        let mut batch = std::mem::take(&mut self.udp_recv_batch);
+        let (_iovecs, mut messages) = batch.prepare(count);
+
+        let received = unsafe {
+            libc::recvmmsg(
+                fd,
+                messages.as_mut_ptr(),
+                count as libc::c_uint,
+                libc::MSG_DONTWAIT,
+                std::ptr::null_mut(),
+            )
+        };
+
+        let result = if received < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::WouldBlock {
+                Ok(0)
+            } else {
+                Err(listen_io(error))
+            }
+        } else {
+            let received = received as usize;
+            let mut result = Ok(received);
+            for index_in_batch in 0..received {
+                let len = messages[index_in_batch].msg_len as usize;
+                if len == 0 || len > MAX_DATAGRAM_SIZE {
+                    continue;
+                }
+                let Some(peer) = socket_addr_from_storage(&batch.addrs[index_in_batch]) else {
+                    continue;
+                };
+                if let Err(error) =
+                    self.handle_udp_datagram(index, peer, &batch.buffers[index_in_batch][..len])
+                {
+                    result = Err(error);
+                    break;
+                }
+            }
+            result
+        };
+
+        self.udp_recv_batch = batch;
+        result
+    }
+
+    fn handle_udp_datagram(
+        &mut self,
+        index: usize,
+        peer: SocketAddr,
+        datagram: &[u8],
+    ) -> Result<(), TincdError> {
+        let len = datagram.len();
+        let source = if let Some(source) = self.udp_source_node(peer) {
+            source
+        } else {
+            match self.packet_codec.verify_direct_datagram_source(datagram) {
+                Ok(Some(source)) => source.to_owned(),
+                Ok(None) | Err(_) => match self.legacy_udp_try_harder(peer, datagram) {
+                    Some(source) => source,
+                    None => return Ok(()),
+                },
+            }
+        };
+        self.udp_socket_by_peer.insert(source.clone(), index);
+        if self.handle_sptps_udp_envelope(&source, peer, index, datagram)? {
+            return Ok(());
+        }
+        let packet = if let Some(session) = self.packet_codec.peer(&source) {
+            let expected = session.packet_type();
+            let record = match self.packet_codec.decode_record(&source, datagram) {
+                Ok(record) => record,
+                Err(error) => {
+                    self.record_packet_diag(format!("udp-drop:sptps-decode:{source}"), |count| {
+                        format!(
+                            "diag udp-drop source={source} peer={peer} count={count} reason=sptps-decode error={error} len={len}"
+                        )
+                    });
+                    return Ok(());
+                }
+            };
+            if record.record_type == SPTPS_UDP_PROBE_TYPE {
+                self.note_udp_recent_len(&source, record.payload.len());
+                self.handle_udp_probe_payload(&source, peer, index, &record.payload, true, true)?;
+                self.update_node_udp_like_tinc(&source, peer, index);
+                return Ok(());
+            }
+            if record.record_type != expected {
+                self.record_packet_diag(format!("udp-drop:sptps-type:{source}"), |count| {
+                    format!(
+                        "diag udp-drop source={source} peer={peer} count={count} reason=sptps-type actual={} expected={} payload_len={}",
+                        record.record_type,
+                        expected,
+                        record.payload.len()
+                    )
+                });
+                return Ok(());
+            }
+            match sptps_packet_from_payload(record.record_type, record.payload) {
+                Ok(packet) => packet,
+                Err(error) => {
+                    self.record_packet_diag(format!("udp-drop:sptps-packet:{source}"), |count| {
+                        format!(
+                            "diag udp-drop source={source} peer={peer} count={count} reason=sptps-packet error={error}"
+                        )
+                    });
+                    return Ok(());
+                }
+            }
+        } else if self.legacy_codec.peer(&source).is_some() {
+            match self.legacy_codec.decode(&source, datagram) {
+                Ok(packet) => packet,
+                Err(error) => {
+                    self.record_packet_diag(format!("udp-drop:legacy-decode:{source}"), |count| {
+                        format!(
+                            "diag udp-drop source={source} peer={peer} count={count} reason=legacy-decode error={error} len={len}"
+                        )
+                    });
+                    return Ok(());
+                }
+            }
+        } else {
+            self.request_sptps_key_after_unkeyed_udp_like_tinc(&source, datagram)?;
+            self.record_packet_diag(format!("udp-drop:no-key:{source}"), |count| {
+                format!(
+                    "diag udp-drop source={source} peer={peer} count={count} reason=no-key len={len}"
+                )
+            });
+            return Ok(());
+        };
+        self.note_udp_recent_len(&source, packet.len());
+        if is_udp_probe_payload(&packet.data) {
+            let secure_udp = self.packet_codec.peer(&source).is_some()
+                || self.legacy_codec.peer(&source).is_some();
+            self.handle_udp_probe_payload(&source, peer, index, &packet.data, secure_udp, true)?;
+            self.update_node_udp_like_tinc(&source, peer, index);
+            return Ok(());
+        }
+        self.record_inbound_traffic(&source, packet.len());
+        self.capture_control_pcap_packet(&packet);
+        let peer_options = self.peer_options_snapshot();
+        let udp_target_snapshots = self.udp_target_snapshot();
+        let sptps_route_snapshots = self.sptps_route_snapshot();
+        let legacy_key_snapshots = self.legacy_key_snapshot();
+        let mut legacy_key_actions = Vec::new();
+        let mut sptps_key_actions = Vec::new();
+        let mut mtu_reductions = Vec::new();
+        let mut legacy_nested_tx_targets = Vec::new();
+        let mut transport = RuntimeUdpPacketTransport {
+            local_name: &self.local_name,
+            sockets: &self.listen_sockets,
+            addresses: &self.addresses,
+            udp_socket_by_peer: &self.udp_socket_by_peer,
+            modern_peer_keys: &self.keys.peer_public_keys,
+            meta_connections: &mut self.meta_connections,
+            experimental: self.state.experimental,
+            local_tcp_only: self.local_tcp_only,
+            max_output_buffer_size: self.max_output_buffer_size,
+            peer_options,
+            packet_codec: &mut self.packet_codec,
+            legacy_codec: &mut self.legacy_codec,
+            udp_target_snapshots,
+            udp_unconfirmed_guess_counter: &mut self.udp_unconfirmed_guess_counter,
+            sptps_route_snapshots,
+            legacy_key_snapshots,
+            legacy_last_req_key: &mut self.legacy_last_req_key,
+            legacy_key_actions: &mut legacy_key_actions,
+            sptps_key_actions: &mut sptps_key_actions,
+            mtu_reductions: &mut mtu_reductions,
+            legacy_nested_tx_targets: &mut legacy_nested_tx_targets,
+            traffic: &mut self.traffic,
+            pcap_subscribers: &mut self.pcap_subscribers,
+            priority_inheritance: self.engine_config.route.priority_inheritance,
+        };
+
+        let events = handle_network_packet_with(
+            &mut self.state,
+            &mut self.device,
+            &mut transport,
+            &self.engine_config,
+            &source,
+            packet,
+        )
+        .map_err(engine_error)?;
+        self.handle_legacy_key_actions(legacy_key_actions)?;
+        self.handle_sptps_key_actions(sptps_key_actions)?;
+        self.apply_mtu_reductions(mtu_reductions);
+        self.handle_legacy_nested_tx_targets_like_tinc(legacy_nested_tx_targets)?;
+        self.handle_engine_events(events)?;
+        self.update_node_udp_like_tinc(&source, peer, index);
+        Ok(())
     }
 
     pub(crate) fn handle_sptps_udp_envelope(
@@ -2076,7 +2473,14 @@ impl RuntimeDaemonState {
 
         if record.record_type == SPTPS_UDP_PROBE_TYPE {
             self.note_udp_recent_len(&source, record.payload.len());
-            self.handle_udp_probe_payload(&source, peer, socket_index, &record.payload, true)?;
+            self.handle_udp_probe_payload(
+                &source,
+                peer,
+                socket_index,
+                &record.payload,
+                true,
+                !relayed_to_local,
+            )?;
             return Ok(true);
         }
         if record.record_type != expected {
@@ -2174,7 +2578,7 @@ impl RuntimeDaemonState {
             destination,
             &relay_hint,
             owner_packet_len,
-            SptpsRelaySelection::PreferVia,
+            false,
         );
         let Some(relay_node) = self.state.graph.node(&targets.udp_relay) else {
             return Ok(());
@@ -2186,7 +2590,7 @@ impl RuntimeDaemonState {
         let relay_min_mtu = relay_node.min_mtu;
         let relay_supports_udp_relay = option_version(relay_node.options) >= 4;
         let relay_tcp_only = self.local_tcp_only || relay_node.options & OPTION_TCPONLY != 0;
-        let direct = targets.udp_relay == destination;
+        let direct = source == self.local_name && targets.udp_relay == destination;
         let needs_tcp_fallback = relay_tcp_only
             || (!direct && !relay_supports_udp_relay)
             || owner_packet_len > relay_min_mtu;
@@ -2195,11 +2599,11 @@ impl RuntimeDaemonState {
         let datagram = envelope.encode();
 
         if needs_tcp_fallback {
-            if let Some(connection) = self
-                .meta_connections
-                .iter_mut()
-                .find(|connection| connection.active_name() == Some(targets.tcp_target.as_str()))
-            {
+            let connection_index = self
+                .current_meta_connection_id_for_peer(&targets.tcp_target)
+                .and_then(|id| self.connection_index_by_id(id));
+            if let Some(index) = connection_index {
+                let connection = &mut self.meta_connections[index];
                 if option_version(connection.options) >= 7 {
                     if let Err(error) = send_sptps_tcp_packet_on_connection(
                         connection,
@@ -2291,6 +2695,7 @@ impl RuntimeDaemonState {
         let mut legacy_key_actions = Vec::new();
         let mut sptps_key_actions = Vec::new();
         let mut mtu_reductions = Vec::new();
+        let mut legacy_nested_tx_targets = Vec::new();
         let mut transport = RuntimeUdpPacketTransport {
             local_name: &self.local_name,
             sockets: &self.listen_sockets,
@@ -2312,8 +2717,8 @@ impl RuntimeDaemonState {
             legacy_key_actions: &mut legacy_key_actions,
             sptps_key_actions: &mut sptps_key_actions,
             mtu_reductions: &mut mtu_reductions,
+            legacy_nested_tx_targets: &mut legacy_nested_tx_targets,
             traffic: &mut self.traffic,
-            pcap_packets: &mut self.pcap_packets,
             pcap_subscribers: &mut self.pcap_subscribers,
             priority_inheritance: self.engine_config.route.priority_inheritance,
         };
@@ -2330,6 +2735,7 @@ impl RuntimeDaemonState {
         self.handle_legacy_key_actions(legacy_key_actions)?;
         self.handle_sptps_key_actions(sptps_key_actions)?;
         self.apply_mtu_reductions(mtu_reductions);
+        self.handle_legacy_nested_tx_targets_like_tinc(legacy_nested_tx_targets)?;
         self.handle_engine_events(events)
     }
 
@@ -2369,7 +2775,6 @@ impl RuntimeDaemonState {
                 peer.port().to_string(),
             ));
             node.status.udp_confirmed = false;
-            node.status.ping_sent = false;
             node.mtu_probes = 0;
             node.min_mtu = 0;
             node.max_mtu = DEFAULT_MTU;
@@ -2388,7 +2793,7 @@ impl RuntimeDaemonState {
         let Some(node) = self.state.graph.node(source) else {
             return Ok(());
         };
-        if !node.status.reachable || !node.status.sptps || !node.status.udp_confirmed {
+        if !node.status.reachable || !node.status.sptps {
             return Ok(());
         }
         if node.status.waiting_for_key || self.packet_codec.peer(source).is_some() {
@@ -2597,7 +3002,7 @@ impl RuntimeDaemonState {
         }
 
         let options = node.options;
-        let has_direct_connection = self.has_meta_connection_with_name(peer);
+        let has_direct_connection = self.has_authenticated_meta_connection_with_name(peer);
         if has_direct_connection && (self.local_tcp_only || options & OPTION_TCPONLY != 0) {
             return Ok(());
         }
@@ -3086,6 +3491,83 @@ impl RuntimeDaemonState {
         Ok(None)
     }
 
+    pub(crate) fn send_sptps_udp_probe_payload_like_tinc(
+        &mut self,
+        peer: &str,
+        payload: &[u8],
+    ) -> Result<(), TincdError> {
+        if self.packet_codec.peer(peer).is_none() {
+            return Ok(());
+        }
+
+        let Some(node) = self.state.graph.node(peer) else {
+            return Ok(());
+        };
+        if !node.status.reachable {
+            return Ok(());
+        }
+
+        let relay = node
+            .route
+            .via
+            .as_deref()
+            .filter(|via| *via != self.local_name)
+            .filter(|via| {
+                self.state
+                    .graph
+                    .node(via)
+                    .is_some_and(|via_node| option_version(via_node.options) >= 4)
+            })
+            .or(node.route.next_hop.as_deref())
+            .unwrap_or(peer)
+            .to_owned();
+        if self.local_tcp_only
+            || self
+                .state
+                .graph
+                .node(&relay)
+                .is_some_and(|relay_node| relay_node.options & OPTION_TCPONLY != 0)
+        {
+            return Ok(());
+        }
+
+        let Some(target) = self.udp_probe_target(&relay) else {
+            return Ok(());
+        };
+        let Some(socket_index) = self.listen_socket_index_for_peer(&relay, target) else {
+            return Ok(());
+        };
+        let datagram = if relay == peer {
+            self.packet_codec
+                .encode_direct_record(peer, SPTPS_UDP_PROBE_TYPE, payload)
+        } else {
+            self.packet_codec
+                .encode_relayed_record(peer, SPTPS_UDP_PROBE_TYPE, payload)
+        }
+        .map_err(|error| TincdError::RuntimeState(error.to_string()))?;
+
+        let sent = match self.listen_sockets[socket_index]
+            .udp
+            .send_to(&datagram, target)
+        {
+            Ok(sent) => sent,
+            Err(error) => {
+                if error.raw_os_error() == Some(libc::EMSGSIZE) {
+                    self.reduce_mtu(&relay, payload.len().saturating_sub(1));
+                }
+                return Ok(());
+            }
+        };
+        if sent != datagram.len() {
+            return Err(TincdError::ListenIo(format!(
+                "short UDP SPTPS probe send: {sent} < {}",
+                datagram.len()
+            )));
+        }
+
+        Ok(())
+    }
+
     pub(crate) fn udp_probe_target(&mut self, peer: &str) -> Option<SocketAddr> {
         let snapshot = RuntimeUdpTargetSnapshot::from_state(&self.state, &self.addresses, peer);
         choose_udp_target_from_snapshot(&snapshot, &mut self.udp_unconfirmed_guess_counter)
@@ -3202,18 +3684,37 @@ impl RuntimeDaemonState {
         socket_index: usize,
         payload: &[u8],
         secure_udp: bool,
+        direct: bool,
     ) -> Result<(), TincdError> {
         if payload.is_empty() || !secure_udp {
             return Ok(());
         }
 
         if payload[0] == 0 {
-            self.send_udp_probe_reply(source, peer, socket_index, payload)?;
+            if direct {
+                self.send_udp_probe_reply(source, peer, socket_index, payload)?;
+            } else {
+                self.send_sptps_udp_probe_reply_like_tinc(source, payload)?;
+            }
         } else {
             self.apply_udp_probe_reply(source, payload);
         }
 
         Ok(())
+    }
+
+    pub(crate) fn send_sptps_udp_probe_reply_like_tinc(
+        &mut self,
+        source: &str,
+        request: &[u8],
+    ) -> Result<(), TincdError> {
+        let Some(options) = self.state.graph.node(source).map(|node| node.options) else {
+            return Ok(());
+        };
+        let Some(reply) = udp_probe_reply_payload(request, options) else {
+            return Ok(());
+        };
+        self.send_sptps_udp_probe_payload_like_tinc(source, &reply)
     }
 
     pub(crate) fn send_udp_probe_reply(
@@ -3319,106 +3820,163 @@ impl RuntimeDaemonState {
         self.try_fix_mtu(source);
     }
 
+    #[cfg(test)]
     pub(crate) fn read_meta_connections(&mut self) -> Result<(), TincdError> {
-        let mut index = 0;
-        let mut buffer = [0u8; 4096];
+        if self.topology_backoff.active(Instant::now()) {
+            return Ok(());
+        }
 
-        while index < self.meta_connections.len() {
-            let connection_id = self.meta_connections[index].id;
-            let mut close = false;
+        let ids = self
+            .meta_connections
+            .iter()
+            .map(|connection| connection.id)
+            .collect::<Vec<_>>();
 
-            loop {
-                match self.meta_connections[index].stream.read(&mut buffer) {
-                    Ok(0) => {
-                        close = true;
-                        break;
-                    }
-                    Ok(len) => {
-                        self.meta_connections[index].bytes_read += len as u64;
-                        self.meta_connections[index].last_activity = Instant::now();
-                        self.meta_connections[index].last_ping_sent = None;
-                        if let Err(error) = self.handle_meta_bytes(index, &buffer[..len]) {
-                            if is_meta_connection_scoped_error(&error) {
-                                close = true;
-                                break;
-                            }
-                            return Err(error);
-                        }
-                        let Some(updated_index) = self.connection_index_by_id(connection_id) else {
-                            break;
-                        };
-                        index = updated_index;
-                    }
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
-                    Err(_) => {
-                        close = true;
-                        break;
-                    }
-                }
-            }
-
-            let Some(updated_index) = self.connection_index_by_id(connection_id) else {
-                continue;
-            };
-            index = updated_index;
-
-            if close || self.meta_connections[index].close_requested {
-                self.close_meta_connection(index)?;
-            } else {
-                index += 1;
-            }
+        for id in ids {
+            while matches!(
+                self.read_meta_connection_once_by_id(id)?,
+                RuntimeIoProgress::Processed
+            ) {}
         }
 
         Ok(())
     }
 
+    pub(crate) fn read_meta_connection_once_by_id(
+        &mut self,
+        id: u64,
+    ) -> Result<RuntimeIoProgress, TincdError> {
+        if self.topology_backoff.active(Instant::now()) {
+            return Ok(RuntimeIoProgress::NotReady);
+        }
+
+        let Some(index) = self.connection_index_by_id(id) else {
+            return Ok(RuntimeIoProgress::NotReady);
+        };
+        self.read_meta_connection_once(index)
+    }
+
+    pub(crate) fn read_meta_connection_once(
+        &mut self,
+        index: usize,
+    ) -> Result<RuntimeIoProgress, TincdError> {
+        if index >= self.meta_connections.len() {
+            return Ok(RuntimeIoProgress::NotReady);
+        }
+        let connection_id = self.meta_connections[index].id;
+        let mut buffer = vec![0u8; MAX_META_BUFFER_SIZE];
+
+        let len = match self.meta_connections[index].stream.read(&mut buffer) {
+            Ok(0) => {
+                self.close_meta_connection_for_reason(index, "meta-read-eof")?;
+                return Ok(RuntimeIoProgress::Processed);
+            }
+            Ok(len) => len,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                if self
+                    .connection_index_by_id(connection_id)
+                    .is_some_and(|index| {
+                        self.meta_connections[index].close_requested
+                            && !self.meta_connections[index].has_pending_output()
+                    })
+                    && let Some(index) = self.connection_index_by_id(connection_id)
+                {
+                    self.close_meta_connection_for_reason(index, "close-requested-after-drain")?;
+                    return Ok(RuntimeIoProgress::Processed);
+                }
+                return Ok(RuntimeIoProgress::NotReady);
+            }
+            Err(error) => {
+                self.close_meta_connection_with_detail(index, "meta-read-error", error)?;
+                return Ok(RuntimeIoProgress::Processed);
+            }
+        };
+
+        let Some(index) = self.connection_index_by_id(connection_id) else {
+            return Ok(RuntimeIoProgress::Processed);
+        };
+        self.meta_connections[index].bytes_read += len as u64;
+        self.meta_connections[index].last_activity = Instant::now();
+        if let Err(error) = self.handle_meta_bytes(index, &buffer[..len]) {
+            if is_meta_connection_scoped_error(&error) {
+                if let Some(index) = self.connection_index_by_id(connection_id) {
+                    self.close_meta_connection_with_detail(index, "meta-protocol-error", error)?;
+                }
+                return Ok(RuntimeIoProgress::Processed);
+            }
+            return Err(error);
+        }
+
+        if let Some(index) = self.connection_index_by_id(connection_id)
+            && self.meta_connections[index].close_requested
+            && !self.meta_connections[index].has_pending_output()
+        {
+            self.close_meta_connection_for_reason(index, "close-requested-after-read")?;
+        }
+
+        Ok(RuntimeIoProgress::Processed)
+    }
+
+    #[cfg(test)]
     pub(crate) fn send_meta_keepalives(&mut self) -> Result<(), TincdError> {
+        self.send_meta_keepalives_at(Instant::now())
+    }
+
+    pub(crate) fn send_meta_keepalives_at(&mut self, now: Instant) -> Result<(), TincdError> {
         let mut index = 0;
 
         while index < self.meta_connections.len() {
-            let active_peer = self.meta_connections[index]
-                .active_name()
-                .map(str::to_owned);
-            if active_peer.is_none() {
-                index += 1;
-                continue;
-            }
-
-            let now = Instant::now();
-            let idle = now.saturating_duration_since(self.meta_connections[index].last_activity);
             let mut close = false;
 
-            if self.meta_connections[index].is_active_authenticated() {
-                if idle >= self.ping_timeout
-                    && let Some(peer) = active_peer.as_deref()
-                {
-                    self.try_udp_for_peer(peer)?;
-                }
+            if self.meta_connections[index].edge_peer.is_none() {
+                let ping_elapsed =
+                    now.saturating_duration_since(self.meta_connections[index].last_ping_time);
+                close = ping_elapsed >= self.ping_timeout;
+            } else {
+                let connection_id = self.meta_connections[index].id;
+                let ping_elapsed =
+                    now.saturating_duration_since(self.meta_connections[index].last_ping_time);
 
-                if idle >= self.ping_interval {
+                if ping_elapsed >= self.ping_timeout {
+                    if let Some(peer) = self.meta_connections[index]
+                        .active_name()
+                        .map(str::to_owned)
+                    {
+                        self.try_tx_like_tinc(&peer, false)?;
+                    }
+
+                    let Some(current_index) = self.connection_index_by_id(connection_id) else {
+                        continue;
+                    };
+                    index = current_index;
+
                     match self.meta_connections[index].last_ping_sent {
-                        Some(sent) if now.saturating_duration_since(sent) >= self.ping_timeout => {
-                            close = true;
-                        }
-                        Some(_) => {}
-                        None => match self.send_active_meta_message(index, &MetaMessage::Ping) {
-                            Ok(chunk) => {
-                                if self.write_meta_chunk(index, &chunk).is_ok() {
-                                    self.meta_connections[index].last_ping_sent = Some(now);
-                                } else {
-                                    close = true;
-                                }
+                        Some(_) => close = true,
+                        None if ping_elapsed >= self.ping_interval => {
+                            match self.send_active_meta_message(index, &MetaMessage::Ping) {
+                                Ok(chunk) => match self.write_meta_chunk(index, &chunk) {
+                                    Ok(()) => {
+                                        if let Some(connection) =
+                                            self.meta_connections.get_mut(index)
+                                        {
+                                            connection.last_ping_time = now;
+                                            connection.last_ping_sent = Some(now);
+                                        } else {
+                                            close = true;
+                                        }
+                                    }
+                                    Err(_) => close = true,
+                                },
+                                Err(_) => close = true,
                             }
-                            Err(_) => close = true,
-                        },
+                        }
+                        None => {}
                     }
                 }
-            } else if idle >= self.ping_timeout {
-                close = true;
             }
 
             if close {
-                self.close_meta_connection(index)?;
+                self.close_meta_connection_for_reason(index, "meta-keepalive-timeout")?;
             } else {
                 index += 1;
             }
@@ -3450,7 +4008,7 @@ impl RuntimeDaemonState {
             return Ok(());
         }
 
-        self.next_mac_subnet_age = now + MAC_SUBNET_AGE_INTERVAL;
+        self.next_mac_subnet_age = now + tinc_timer_jitter_duration(TINC_AGING_INTERVAL);
         self.expire_dynamic_mac_subnets_at(current_unix_secs())
     }
 
@@ -3520,24 +4078,7 @@ impl RuntimeDaemonState {
 
         for (id, peer) in targets {
             let message = self.generate_legacy_answer_key_message(&peer)?;
-            let Some(index) = self.connection_index_by_id(id) else {
-                continue;
-            };
-            let chunk = match self.send_active_meta_message(index, &message) {
-                Ok(chunk) => chunk,
-                Err(error) if is_meta_connection_scoped_error(&error) => {
-                    self.close_meta_connection(index)?;
-                    continue;
-                }
-                Err(error) => return Err(error),
-            };
-            if let Err(error) = self.write_meta_chunk(index, &chunk) {
-                if is_meta_connection_scoped_error(&error) {
-                    self.close_meta_connection(index)?;
-                } else {
-                    return Err(error);
-                }
-            }
+            self.send_active_meta_message_to_id(id, &message)?;
         }
 
         Ok(())
@@ -3582,43 +4123,137 @@ impl RuntimeDaemonState {
     }
 
     pub(crate) fn close_meta_connection(&mut self, index: usize) -> Result<(), TincdError> {
-        self.close_meta_connection_with_report(index, true)
+        self.close_meta_connection_for_reason(index, "unspecified")
+    }
+
+    pub(crate) fn close_meta_connection_for_reason(
+        &mut self,
+        index: usize,
+        reason: &'static str,
+    ) -> Result<(), TincdError> {
+        self.close_meta_connection_with_report(index, true, reason)
+    }
+
+    pub(crate) fn close_meta_connection_with_detail(
+        &mut self,
+        index: usize,
+        reason: &'static str,
+        detail: impl fmt::Display,
+    ) -> Result<(), TincdError> {
+        self.pending_close_reason = Some(format!("{reason}: {detail}"));
+        let result = self.close_meta_connection_with_report(index, true, reason);
+        if self.pending_close_reason.is_some() {
+            self.pending_close_reason = None;
+        }
+        result
+    }
+
+    pub(crate) fn close_meta_connection_by_id_with_detail(
+        &mut self,
+        id: u64,
+        reason: &'static str,
+        detail: impl fmt::Display,
+    ) -> Result<(), TincdError> {
+        if let Some(index) = self.connection_index_by_id(id) {
+            self.close_meta_connection_with_detail(index, reason, detail)?;
+        }
+        Ok(())
     }
 
     pub(crate) fn close_meta_connection_with_report(
         &mut self,
         index: usize,
         report: bool,
+        reason: &'static str,
     ) -> Result<(), TincdError> {
+        let connection_id = self.meta_connections[index].id;
         let peer = match &self.meta_connections[index].kind {
             RuntimeMetaConnectionKind::Active {
                 name: Some(name), ..
             } => Some(name.clone()),
             _ => None,
         };
+        let is_outgoing = self.meta_connections[index].outgoing_peer.is_some();
+        let connecting = self.meta_connections[index].connecting;
+        let active = self.meta_connections[index].is_active_authenticated();
+        let retry_outgoing = is_outgoing
+            && self.meta_connections[index]
+                .outgoing_peer
+                .as_ref()
+                .is_some_and(|peer| self.outgoing_retry.contains_key(peer));
+        let retry_autoconnect = is_outgoing
+            && self.meta_connections[index]
+                .outgoing_peer
+                .as_ref()
+                .is_some_and(|peer| {
+                    self.meta_connections[index].outgoing_autoconnect
+                        && self.autoconnect_outgoing.contains_key(peer)
+                });
+        let outgoing_peer = self.meta_connections[index].outgoing_peer.clone();
+        let config = self.runtime_config.clone();
         let _exec_proxy = self.meta_connections[index].exec_proxy.take();
+        let edge_peer = self.meta_connections[index].edge_peer.take();
+        let close_reason = self
+            .pending_close_reason
+            .take()
+            .unwrap_or_else(|| reason.to_owned());
+        self.record_log_with_priority(
+            DEBUG_CONNECTIONS,
+            LOG_DEBUG,
+            format!(
+                "Closing meta connection id={connection_id} reason={close_reason} peer={} outgoing={is_outgoing} active={active} connecting={connecting} report={report} edge={}",
+                peer.as_deref().unwrap_or("<unknown>"),
+                edge_peer.as_deref().unwrap_or("<none>")
+            ),
+        );
         self.meta_connections.remove(index);
 
-        if let Some(peer) = peer {
+        if let Some(peer) = edge_peer.as_deref()
+            && self
+                .local_edge_connections
+                .get(peer)
+                .is_none_or(|owner| *owner == connection_id)
+        {
             let local_name = self.local_name.clone();
-            if self.state.graph.edge(&local_name, &peer).is_some() {
-                let forward = self.delete_edge_message(&local_name, &peer);
+            if self.state.graph.edge(&local_name, peer).is_some() {
+                let forward = self.delete_edge_message(&local_name, peer);
                 if report && !self.tunnel_server {
                     self.broadcast_active_meta_message_except(None, &forward)?;
                 }
                 self.apply_runtime_meta_message(forward)?;
+                self.local_edge_connections.remove(peer);
 
                 let peer_unreachable = self
                     .state
                     .graph
-                    .node(&peer)
+                    .node(peer)
                     .is_some_and(|node| !node.status.reachable);
-                if peer_unreachable && self.state.graph.edge(&peer, &local_name).is_some() {
-                    let reverse = self.delete_edge_message(&peer, &local_name);
+                if peer_unreachable && self.state.graph.edge(peer, &local_name).is_some() {
+                    let reverse = self.delete_edge_message(peer, &local_name);
                     if report && !self.tunnel_server {
                         self.broadcast_active_meta_message_except(None, &reverse)?;
                     }
                     self.apply_runtime_meta_message(reverse)?;
+                }
+            }
+        }
+
+        if let Some(peer) = outgoing_peer.or(peer)
+            && !self.has_meta_connection_with_name(&peer)
+        {
+            let now = Instant::now();
+            if retry_outgoing {
+                if self.connect_peer(&config, &peer)? {
+                    self.mark_outgoing_connected(&peer, now);
+                } else {
+                    self.mark_outgoing_failed(&peer, now);
+                }
+            } else if retry_autoconnect {
+                if self.connect_peer(&config, &peer)? {
+                    self.mark_autoconnect_connected(&peer, now);
+                    self.mark_latest_connection_autoconnect(&peer);
+                } else {
+                    self.mark_autoconnect_failed(&peer, now);
                 }
             }
         }
@@ -3636,9 +4271,7 @@ impl RuntimeDaemonState {
             .meta_connections
             .iter()
             .find(|connection| {
-                connection.id != new_id
-                    && connection.is_active_authenticated()
-                    && connection.active_name() == Some(peer)
+                connection.id != new_id && connection.authenticated_name() == Some(peer)
             })
             .map(|connection| connection.id);
         let Some(existing_id) = existing_id else {
@@ -3646,7 +4279,14 @@ impl RuntimeDaemonState {
         };
 
         if let Some(existing_index) = self.connection_index_by_id(existing_id) {
-            self.close_meta_connection_with_report(existing_index, false)?;
+            let existing_outgoing_peer = self.meta_connections[existing_index].outgoing_peer.take();
+            let existing_outgoing = existing_outgoing_peer.is_some();
+            let existing_autoconnect = self.meta_connections[existing_index].outgoing_autoconnect;
+            if existing_outgoing && let Some(new_index) = self.connection_index_by_id(new_id) {
+                self.meta_connections[new_index].outgoing_peer = existing_outgoing_peer;
+                self.meta_connections[new_index].outgoing_autoconnect = existing_autoconnect;
+            }
+            self.close_meta_connection_with_report(existing_index, false, "duplicate-ack")?;
             self.state.recompute_routes();
         }
 
@@ -3686,7 +4326,7 @@ impl RuntimeDaemonState {
         index: usize,
         bytes: &[u8],
     ) -> Result<(), TincdError> {
-        let Some((id_line, trailing)) = self.pending_incoming_id_line(index, bytes) else {
+        let Some((id_line, trailing)) = self.pending_incoming_id_line(index, bytes)? else {
             return Ok(());
         };
         let line = String::from_utf8(trim_meta_line(&id_line).to_vec())
@@ -3721,13 +4361,16 @@ impl RuntimeDaemonState {
             };
         }
 
+        let connection_id = self.meta_connections[index].id;
         if let Some(response_id) = response_id {
-            self.write_meta_chunk(index, &response_id)?;
+            self.write_meta_chunk_to_id(connection_id, &response_id)?;
         }
         self.apply_meta_step(index, step)?;
 
         if !trailing.is_empty() {
-            self.handle_active_meta_bytes(index, &trailing)?;
+            if let Some(index) = self.connection_index_by_id(connection_id) {
+                self.handle_active_meta_bytes(index, &trailing)?;
+            }
         }
 
         Ok(())
@@ -3784,12 +4427,15 @@ impl RuntimeDaemonState {
             };
         }
 
+        let connection_id = self.meta_connections[index].id;
         for chunk in chunks {
-            self.write_meta_chunk(index, &chunk)?;
+            self.write_meta_chunk_to_id(connection_id, &chunk)?;
         }
 
         if !trailing.is_empty() {
-            self.handle_invitation_bytes(index, &trailing)?;
+            if let Some(index) = self.connection_index_by_id(connection_id) {
+                self.handle_invitation_bytes(index, &trailing)?;
+            }
         }
 
         Ok(())
@@ -3819,7 +4465,9 @@ impl RuntimeDaemonState {
                 return Ok(());
             };
 
-            decoder.push(bytes);
+            decoder
+                .push(bytes)
+                .map_err(|error| TincdError::MetaConnection(error.to_string()))?;
 
             loop {
                 let Some(frame) = decoder
@@ -3903,8 +4551,9 @@ impl RuntimeDaemonState {
             }
         }
 
+        let connection_id = self.meta_connections[index].id;
         for chunk in outbound {
-            self.write_meta_chunk(index, &chunk)?;
+            self.write_meta_chunk_to_id(connection_id, &chunk)?;
         }
 
         if let Some((name, key)) = accepted_peer {
@@ -3975,15 +4624,24 @@ impl RuntimeDaemonState {
     }
 
     pub(crate) fn has_meta_connection_with_name(&self, peer: &str) -> bool {
+        self.meta_connections
+            .iter()
+            .any(|connection| connection.active_name() == Some(peer))
+    }
+
+    pub(crate) fn has_pending_or_authenticated_meta_connection_with_name(
+        &self,
+        peer: &str,
+    ) -> bool {
         self.meta_connections.iter().any(|connection| {
-            matches!(
-                &connection.kind,
-                RuntimeMetaConnectionKind::Active {
-                    name: Some(name),
-                    ..
-                } if name == peer
-            )
+            connection.active_name() == Some(peer)
+                || connection.authenticated_name() == Some(peer)
+                || connection.outgoing_peer.as_deref() == Some(peer)
         })
+    }
+
+    pub(crate) fn has_authenticated_meta_connection_with_name(&self, peer: &str) -> bool {
+        self.current_meta_connection_id_for_peer(peer).is_some()
     }
 
     pub(crate) fn local_options_for_peer(&self, peer: &str) -> u32 {
@@ -4149,19 +4807,28 @@ impl RuntimeDaemonState {
         &mut self,
         index: usize,
         bytes: &[u8],
-    ) -> Option<(Vec<u8>, Vec<u8>)> {
+    ) -> Result<Option<(Vec<u8>, Vec<u8>)>, TincdError> {
         let RuntimeMetaConnectionKind::PendingIncoming { buffer } =
             &mut self.meta_connections[index].kind
         else {
-            return None;
+            return Ok(None);
         };
 
         buffer.extend_from_slice(bytes);
-        let newline = buffer.iter().position(|byte| *byte == b'\n')?;
+        if buffer.len() > MAX_META_BUFFER_SIZE {
+            return Err(TincdError::MetaConnection(format!(
+                "meta input buffer full: {} bytes, maximum is {}",
+                buffer.len(),
+                MAX_META_BUFFER_SIZE
+            )));
+        }
+        let Some(newline) = buffer.iter().position(|byte| *byte == b'\n') else {
+            return Ok(None);
+        };
         let trailing = buffer.split_off(newline + 1);
         let id_line = std::mem::take(buffer);
 
-        Some((id_line, trailing))
+        Ok(Some((id_line, trailing)))
     }
 
     pub(crate) fn handle_active_meta_bytes(
@@ -4203,6 +4870,13 @@ impl RuntimeDaemonState {
             ProxyHandshake::None => Ok(Some(bytes.to_vec())),
             ProxyHandshake::Http { buffer } => {
                 buffer.extend_from_slice(bytes);
+                if buffer.len() > MAX_META_BUFFER_SIZE {
+                    return Err(TincdError::MetaConnection(format!(
+                        "meta input buffer full: {} bytes, maximum is {}",
+                        buffer.len(),
+                        MAX_META_BUFFER_SIZE
+                    )));
+                }
                 loop {
                     let Some(newline) = buffer.iter().position(|byte| *byte == b'\n') else {
                         return Ok(None);
@@ -4235,6 +4909,13 @@ impl RuntimeDaemonState {
             }
             ProxyHandshake::Socks4 { buffer } => {
                 buffer.extend_from_slice(bytes);
+                if buffer.len() > MAX_META_BUFFER_SIZE {
+                    return Err(TincdError::MetaConnection(format!(
+                        "meta input buffer full: {} bytes, maximum is {}",
+                        buffer.len(),
+                        MAX_META_BUFFER_SIZE
+                    )));
+                }
                 let required = SOCKS4_RESPONSE_LEN;
                 if buffer.len() < required {
                     return Ok(None);
@@ -4247,6 +4928,13 @@ impl RuntimeDaemonState {
             }
             ProxyHandshake::Socks5 { buffer } => {
                 buffer.extend_from_slice(bytes);
+                if buffer.len() > MAX_META_BUFFER_SIZE {
+                    return Err(TincdError::MetaConnection(format!(
+                        "meta input buffer full: {} bytes, maximum is {}",
+                        buffer.len(),
+                        MAX_META_BUFFER_SIZE
+                    )));
+                }
                 let required = socks5_response_len(buffer);
                 if required == 0 || buffer.len() < required {
                     return Ok(None);
@@ -4266,10 +4954,13 @@ impl RuntimeDaemonState {
         step: tinc_runtime::meta::MetaConnectionStep,
     ) -> Result<(), TincdError> {
         let mut index = index;
+        let connection_id = self.meta_connections[index].id;
         let mut responses = Vec::new();
+        let mut topology_responses = Vec::new();
         let mut peer_responses = Vec::new();
+        let mut topology_broadcasts = Vec::new();
         let mut broadcasts = Vec::new();
-        let mut sync_state = false;
+        let mut state_syncs = Vec::new();
 
         for event in step.events {
             match event {
@@ -4281,7 +4972,7 @@ impl RuntimeDaemonState {
                 }) => {
                     let connection_id = self.meta_connections[index].id;
                     let connection_peer_address = self.meta_connections[index].peer;
-                    let outgoing = self.meta_connections[index].is_outgoing();
+                    let outgoing = self.meta_connections[index].outgoing_peer.is_some();
                     self.close_existing_connection_for_new_ack_like_tinc(index, &peer)?;
                     let Some(updated_index) = self.connection_index_by_id(connection_id) else {
                         continue;
@@ -4295,13 +4986,23 @@ impl RuntimeDaemonState {
                     {
                         *name = Some(peer.clone());
                     }
+                    self.meta_connections[active_index].edge_peer = Some(peer.clone());
+                    self.local_edge_connections
+                        .insert(peer.clone(), connection_id);
+                    self.record_log_with_priority(
+                        DEBUG_CONNECTIONS,
+                        LOG_NOTICE,
+                        format!("Connection with {peer} activated"),
+                    );
+                    let existing_state = self.existing_state_messages();
                     let message =
                         self.activated_edge_message(active_index, &peer, &port, weight, options);
                     self.apply_runtime_meta_message(message.clone())?;
+                    state_syncs.push((connection_id, existing_state));
                     if self.tunnel_server {
-                        responses.push(message);
+                        topology_responses.push((connection_id, message));
                     } else {
-                        broadcasts.push((None, message));
+                        topology_broadcasts.push((None, message));
                     }
                     if outgoing {
                         self.add_recent_meta_address_like_tinc(&peer, connection_peer_address);
@@ -4312,7 +5013,6 @@ impl RuntimeDaemonState {
                     {
                         responses.extend(self.start_sptps_key_exchange(&peer)?);
                     }
-                    sync_state = true;
                 }
                 MetaConnectionEvent::Auth(MetaAuthEvent::LegacyEd25519Upgrade {
                     peer,
@@ -4378,7 +5078,12 @@ impl RuntimeDaemonState {
 
                     match &message {
                         MetaMessage::Ping => responses.push(MetaMessage::Pong),
-                        MetaMessage::Pong => self.handle_pong_address_cache_like_tinc(index),
+                        MetaMessage::Pong => {
+                            if let Some(connection) = self.meta_connections.get_mut(index) {
+                                connection.last_ping_sent = None;
+                            }
+                            self.handle_pong_address_cache_like_tinc(index);
+                        }
                         MetaMessage::TerminateRequest => {
                             self.meta_connections[index].close_requested = true;
                         }
@@ -4404,7 +5109,7 @@ impl RuntimeDaemonState {
                         let tunnel_server_key_changed =
                             self.tunnel_server && matches!(&message, MetaMessage::KeyChanged(_));
                         if !tunnel_server_topology && !tunnel_server_key_changed {
-                            broadcasts.push((Some(index), message));
+                            broadcasts.push((Some(connection_id), message));
                         }
                     }
                     if let Some(message) = stale_reverse_edge
@@ -4424,26 +5129,31 @@ impl RuntimeDaemonState {
         }
 
         for chunk in step.outbound {
-            self.write_meta_chunk(index, &chunk)?;
+            self.write_meta_chunk_to_id(connection_id, &chunk)?;
         }
 
-        if sync_state {
-            // Match tinc's activation flow: the new peer learns the existing topology
-            // before we start sending key-exchange traffic or rebroadcast the new edge.
-            self.sync_existing_state_to_peer(index)?;
+        for (id, messages) in state_syncs {
+            self.sync_existing_state_messages_to_peer_id(id, messages)?;
+        }
+
+        for (id, response) in topology_responses {
+            self.send_active_meta_message_to_id(id, &response)?;
+        }
+
+        for (source_id, message) in topology_broadcasts {
+            self.broadcast_active_meta_message_except_id(source_id, &message)?;
         }
 
         for response in responses {
-            let chunk = self.send_active_meta_message(index, &response)?;
-            self.write_meta_chunk(index, &chunk)?;
+            self.send_active_meta_message_to_id(connection_id, &response)?;
         }
 
         for (peer, response) in peer_responses {
             self.send_active_meta_message_to_peer(&peer, &response)?;
         }
 
-        for (source_index, message) in broadcasts {
-            self.broadcast_active_meta_message_except(source_index, &message)?;
+        for (source_id, message) in broadcasts {
+            self.broadcast_active_meta_message_except_id(source_id, &message)?;
         }
 
         Ok(())
@@ -4474,10 +5184,13 @@ impl RuntimeDaemonState {
         Ok(Some(reverse))
     }
 
-    pub(crate) fn sync_existing_state_to_peer(&mut self, index: usize) -> Result<(), TincdError> {
-        for message in self.existing_state_messages() {
-            let chunk = self.send_active_meta_message(index, &message)?;
-            self.write_meta_chunk(index, &chunk)?;
+    pub(crate) fn sync_existing_state_messages_to_peer_id(
+        &mut self,
+        id: u64,
+        messages: Vec<MetaMessage>,
+    ) -> Result<(), TincdError> {
+        for message in messages {
+            self.send_active_meta_message_to_id(id, &message)?;
         }
 
         Ok(())
@@ -4589,8 +5302,9 @@ impl RuntimeDaemonState {
         index: usize,
         message: &MetaMessage,
         responses: &mut Vec<MetaMessage>,
-        broadcasts: &mut Vec<(Option<usize>, MetaMessage)>,
+        broadcasts: &mut Vec<(Option<u64>, MetaMessage)>,
     ) -> bool {
+        let connection_id = self.meta_connections[index].id;
         let peer_name = self.meta_connections[index]
             .active_name()
             .map(str::to_owned);
@@ -4625,7 +5339,7 @@ impl RuntimeDaemonState {
                     *self.packet_codec.ids_mut() = NodeIdTable::from_network_state(&self.state);
                     let forwarded = MetaMessage::AddSubnet(message.clone());
                     self.remember_strict_forwarded_topology(forwarded.clone());
-                    broadcasts.push((Some(index), forwarded));
+                    broadcasts.push((Some(connection_id), forwarded));
                     return true;
                 }
 
@@ -4651,7 +5365,7 @@ impl RuntimeDaemonState {
                     if self.strict_subnets && self.state.graph.node(&message.owner).is_some() {
                         let forwarded = MetaMessage::DeleteSubnet(message.clone());
                         self.remember_strict_forwarded_topology(forwarded.clone());
-                        broadcasts.push((Some(index), forwarded));
+                        broadcasts.push((Some(connection_id), forwarded));
                     }
                     return true;
                 };
@@ -4672,7 +5386,7 @@ impl RuntimeDaemonState {
                 if self.strict_subnets {
                     let forwarded = MetaMessage::DeleteSubnet(message.clone());
                     self.remember_strict_forwarded_topology(forwarded.clone());
-                    broadcasts.push((Some(index), forwarded));
+                    broadcasts.push((Some(connection_id), forwarded));
                     return true;
                 }
 
@@ -4691,6 +5405,7 @@ impl RuntimeDaemonState {
                 }
 
                 if message.edge.from == self.local_name {
+                    self.topology_backoff.note_add_edge();
                     let correction = existing
                         .and_then(|edge| self.add_edge_message_from_runtime_edge(edge))
                         .unwrap_or_else(|| {
@@ -4715,6 +5430,7 @@ impl RuntimeDaemonState {
                 };
 
                 if message.from == self.local_name {
+                    self.topology_backoff.note_del_edge();
                     if let Some(correction) = self.add_edge_message_from_runtime_edge(existing) {
                         responses.push(correction);
                     }
@@ -4775,10 +5491,6 @@ impl RuntimeDaemonState {
         {
             return;
         }
-        const STRICT_FORWARDED_TOPOLOGY_CAPACITY: usize = 256;
-        if self.strict_forwarded_topology.len() >= STRICT_FORWARDED_TOPOLOGY_CAPACITY {
-            self.strict_forwarded_topology.pop_front();
-        }
         self.strict_forwarded_topology.push_back(message);
     }
 
@@ -4807,18 +5519,72 @@ impl RuntimeDaemonState {
     }
 
     pub(crate) fn mark_seen_runtime_message(&mut self, message: &MetaMessage) -> bool {
-        self.past_requests
-            .mark_seen(&message.to_string(), current_unix_secs().max(0) as u64)
+        let seen = self
+            .past_requests
+            .mark_seen(&message.to_string(), current_unix_secs().max(0) as u64);
+        if !seen && self.next_past_request_age.is_none() {
+            self.next_past_request_age =
+                Some(Instant::now() + tinc_timer_jitter_duration(TINC_AGING_INTERVAL));
+        } else if self.past_requests.is_empty() {
+            self.next_past_request_age = None;
+        }
+        seen
     }
 
     pub(crate) fn apply_runtime_meta_message(
         &mut self,
         message: MetaMessage,
     ) -> Result<(), TincdError> {
+        let edge_log = match &message {
+            MetaMessage::AddEdge(message) => Some((
+                "ADD_EDGE",
+                message.edge.from.clone(),
+                message.edge.to.clone(),
+            )),
+            MetaMessage::DeleteEdge(message) => {
+                Some(("DEL_EDGE", message.from.clone(), message.to.clone()))
+            }
+            _ => None,
+        };
         let mutation = self
             .state
             .apply_meta_message_at(message, current_unix_secs())
             .map_err(|error| TincdError::RuntimeState(error.to_string()))?;
+        if let Some((kind, from, to)) = edge_log {
+            if kind == "DEL_EDGE" && from == self.local_name {
+                self.local_edge_connections.remove(&to);
+            }
+            match &mutation {
+                StateMutation::AddEdge {
+                    edge, reachability, ..
+                } => {
+                    self.record_log_with_priority(
+                        DEBUG_PROTOCOL,
+                        LOG_DEBUG,
+                        format!(
+                            "Applied {kind} {from} -> {to}; mutation={edge:?} reachable +{:?} -{:?}",
+                            reachability.became_reachable, reachability.became_unreachable
+                        ),
+                    );
+                }
+                StateMutation::DeleteEdge {
+                    removed,
+                    reachability,
+                } => {
+                    self.record_log_with_priority(
+                        DEBUG_PROTOCOL,
+                        LOG_DEBUG,
+                        format!(
+                            "Applied {kind} {from} -> {to}; removed={} reachable +{:?} -{:?}",
+                            removed.is_some(),
+                            reachability.became_reachable,
+                            reachability.became_unreachable
+                        ),
+                    );
+                }
+                _ => {}
+            }
+        }
         self.run_scripts_for_mutation(&mutation);
         if let StateMutation::KeyChanged { origin } = &mutation
             && self
@@ -4829,8 +5595,33 @@ impl RuntimeDaemonState {
         {
             self.legacy_last_req_key.remove(origin);
         }
+        if let StateMutation::AddEdge { reachability, .. }
+        | StateMutation::DeleteEdge { reachability, .. } = &mutation
+        {
+            self.update_route_udp_endpoints_like_tinc(reachability);
+            self.clear_unreachable_runtime_peer_state_like_tinc(reachability);
+        }
         *self.packet_codec.ids_mut() = NodeIdTable::from_network_state(&self.state);
         Ok(())
+    }
+
+    pub(crate) fn clear_unreachable_runtime_peer_state_like_tinc(
+        &mut self,
+        changes: &tinc_core::graph::ReachabilityChanges,
+    ) {
+        for peer in &changes.became_unreachable {
+            self.packet_codec.remove_peer(peer);
+            self.legacy_codec.remove_peer(peer);
+            self.legacy_last_req_key.remove(peer);
+            self.sptps_last_req_key.remove(peer);
+            if let Some(key_exchange) = &mut self.key_exchange {
+                key_exchange.remove_pending_session(peer);
+            }
+            self.udp_probe.remove(peer);
+            self.udp_socket_by_peer.remove(peer);
+            self.mtu_info_sent.remove(peer);
+            self.udp_info_sent.remove(peer);
+        }
     }
 
     pub(crate) fn forward_runtime_info_message(
@@ -4857,7 +5648,7 @@ impl RuntimeDaemonState {
             self.state.graph.node(&message.from).map(|node| {
                 (
                     node.route.via.clone(),
-                    self.has_meta_connection_with_name(&message.from),
+                    self.has_authenticated_meta_connection_with_name(&message.from),
                     node.status.udp_confirmed,
                 )
             })
@@ -4897,6 +5688,48 @@ impl RuntimeDaemonState {
             .and_then(|node| node.udp_address.as_ref())
             != Some(&endpoint);
         if !changed {
+            return;
+        }
+
+        self.set_node_udp_endpoint_like_tinc(source, endpoint);
+    }
+
+    pub(crate) fn update_route_udp_endpoints_like_tinc(
+        &mut self,
+        reachability: &tinc_core::graph::ReachabilityChanges,
+    ) {
+        let became_reachable = reachability
+            .became_reachable
+            .iter()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        let updates = self
+            .state
+            .graph
+            .nodes()
+            .filter(|node| node.name != self.local_name && node.status.reachable)
+            .filter(|node| {
+                became_reachable.contains(node.name.as_str()) || node.udp_address.is_none()
+            })
+            .filter_map(|node| {
+                let previous = node.route.previous_edge.as_ref()?;
+                let endpoint = self
+                    .state
+                    .graph
+                    .edge(&previous.from, &previous.to)?
+                    .address
+                    .clone()?;
+                Some((node.name.clone(), endpoint))
+            })
+            .collect::<Vec<_>>();
+
+        for (peer, endpoint) in updates {
+            self.set_node_udp_endpoint_like_tinc(&peer, endpoint);
+        }
+    }
+
+    pub(crate) fn set_node_udp_endpoint_like_tinc(&mut self, source: &str, endpoint: EdgeEndpoint) {
+        if source == self.local_name {
             return;
         }
 
@@ -4964,7 +5797,9 @@ impl RuntimeDaemonState {
             return Ok(());
         }
         if from == self.local_name {
-            if self.has_meta_connection_with_name(to) || self.recently_sent_mtu_info(to) {
+            if self.has_authenticated_meta_connection_with_name(to)
+                || self.recently_sent_mtu_info(to)
+            {
                 return Ok(());
             }
         }
@@ -5017,7 +5852,8 @@ impl RuntimeDaemonState {
             return false;
         }
         if from == self.local_name
-            && (self.has_meta_connection_with_name(target) || self.recently_sent_udp_info(target))
+            && (self.has_authenticated_meta_connection_with_name(target)
+                || self.recently_sent_udp_info(target))
         {
             return false;
         }
@@ -5061,7 +5897,7 @@ impl RuntimeDaemonState {
         let connection = self
             .meta_connections
             .iter()
-            .find(|connection| connection.active_name() == Some(target))?;
+            .find(|connection| connection.authenticated_name() == Some(target))?;
         Some(EdgeAddress {
             address: connection.local.ip().to_string(),
             port: connection.local.port().to_string(),
@@ -5626,6 +6462,8 @@ impl RuntimeDaemonState {
         message: &AnswerKeyMessage,
         error: &TincdError,
     ) {
+        self.legacy_codec.clear_outgoing_key_state(&message.from);
+        self.legacy_last_req_key.remove(&message.from);
         match error {
             TincdError::LegacyPacket(LegacyPacketError::InvalidCompression(compression)) => {
                 self.record_log_with_priority(
@@ -5913,6 +6751,14 @@ impl RuntimeDaemonState {
     ) -> Result<(), TincdError> {
         let source_id =
             source_index.and_then(|index| self.meta_connections.get(index).map(|c| c.id));
+        self.broadcast_active_meta_message_except_id(source_id, message)
+    }
+
+    pub(crate) fn broadcast_active_meta_message_except_id(
+        &mut self,
+        source_id: Option<u64>,
+        message: &MetaMessage,
+    ) -> Result<(), TincdError> {
         let targets = self
             .meta_connections
             .iter()
@@ -5922,24 +6768,7 @@ impl RuntimeDaemonState {
             .collect::<Vec<_>>();
 
         for id in targets {
-            let Some(index) = self.connection_index_by_id(id) else {
-                continue;
-            };
-            let chunk = match self.send_active_meta_message(index, message) {
-                Ok(chunk) => chunk,
-                Err(error) if is_meta_connection_scoped_error(&error) => {
-                    self.close_meta_connection(index)?;
-                    continue;
-                }
-                Err(error) => return Err(error),
-            };
-            if let Err(error) = self.write_meta_chunk(index, &chunk) {
-                if is_meta_connection_scoped_error(&error) {
-                    self.close_meta_connection(index)?;
-                } else {
-                    return Err(error);
-                }
-            }
+            self.send_active_meta_message_to_id(id, message)?;
         }
 
         Ok(())
@@ -5951,33 +6780,65 @@ impl RuntimeDaemonState {
         message: &MetaMessage,
     ) -> Result<(), TincdError> {
         let targets = self
-            .meta_connections
-            .iter()
-            .filter(|connection| connection.active_name() == Some(peer))
-            .map(|connection| connection.id)
+            .current_meta_connection_id_for_peer(peer)
+            .into_iter()
             .collect::<Vec<_>>();
 
         for id in targets {
-            let Some(index) = self.connection_index_by_id(id) else {
-                continue;
-            };
-            let chunk = match self.send_active_meta_message(index, message) {
-                Ok(chunk) => chunk,
-                Err(error) if is_meta_connection_scoped_error(&error) => {
-                    self.close_meta_connection(index)?;
-                    continue;
-                }
-                Err(error) => return Err(error),
-            };
-            if let Err(error) = self.write_meta_chunk(index, &chunk) {
-                if is_meta_connection_scoped_error(&error) {
-                    self.close_meta_connection(index)?;
-                } else {
-                    return Err(error);
-                }
-            }
+            self.send_active_meta_message_to_id(id, message)?;
         }
 
+        Ok(())
+    }
+
+    pub(crate) fn current_meta_connection_id_for_peer(&self, peer: &str) -> Option<u64> {
+        self.local_edge_connections
+            .get(peer)
+            .and_then(|id| {
+                self.meta_connections
+                    .iter()
+                    .find(|connection| {
+                        connection.id == *id && connection.can_carry_data_for_peer(peer)
+                    })
+                    .map(|connection| connection.id)
+            })
+            .or_else(|| {
+                self.meta_connections
+                    .iter()
+                    .find(|connection| connection.is_current_edge_connection_for_peer(peer))
+                    .map(|connection| connection.id)
+            })
+            .or_else(|| {
+                self.meta_connections
+                    .iter()
+                    .find(|connection| connection.can_carry_data_for_peer(peer))
+                    .map(|connection| connection.id)
+            })
+    }
+
+    pub(crate) fn send_active_meta_message_to_id(
+        &mut self,
+        id: u64,
+        message: &MetaMessage,
+    ) -> Result<(), TincdError> {
+        let Some(index) = self.connection_index_by_id(id) else {
+            return Ok(());
+        };
+        let chunk = match self.send_active_meta_message(index, message) {
+            Ok(chunk) => chunk,
+            Err(error) if is_meta_connection_scoped_error(&error) => {
+                self.close_meta_connection_by_id_with_detail(id, "meta-send-error", error)?;
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        if let Err(error) = self.write_meta_chunk_to_id(id, &chunk) {
+            if is_meta_connection_scoped_error(&error) {
+                self.close_meta_connection_by_id_with_detail(id, "meta-write-queue-error", error)?;
+            } else {
+                return Err(error);
+            }
+        }
         Ok(())
     }
 
@@ -5986,9 +6847,12 @@ impl RuntimeDaemonState {
         index: usize,
         message: &MetaMessage,
     ) -> Result<Vec<u8>, TincdError> {
-        let RuntimeMetaConnectionKind::Active { driver, .. } =
-            &mut self.meta_connections[index].kind
-        else {
+        let Some(connection) = self.meta_connections.get_mut(index) else {
+            return Err(TincdError::MetaConnection(
+                "meta connection no longer exists".to_owned(),
+            ));
+        };
+        let RuntimeMetaConnectionKind::Active { driver, .. } = &mut connection.kind else {
             return Err(TincdError::MetaConnection(
                 "cannot send meta message on pending connection".to_owned(),
             ));
@@ -6002,27 +6866,116 @@ impl RuntimeDaemonState {
         index: usize,
         chunk: &[u8],
     ) -> Result<(), TincdError> {
-        self.meta_connections[index]
-            .write_meta_chunk(chunk)
-            .map_err(listen_io)
+        let Some(connection) = self.meta_connections.get_mut(index) else {
+            return Ok(());
+        };
+        connection.write_meta_chunk(chunk).map_err(listen_io)
     }
 
-    pub(crate) fn flush_meta_outputs(&mut self) -> Result<(), TincdError> {
-        let mut index = 0;
+    pub(crate) fn write_meta_chunk_to_id(
+        &mut self,
+        id: u64,
+        chunk: &[u8],
+    ) -> Result<(), TincdError> {
+        let Some(index) = self.connection_index_by_id(id) else {
+            return Ok(());
+        };
+        self.write_meta_chunk(index, chunk)
+    }
 
-        while index < self.meta_connections.len() {
+    #[cfg(test)]
+    pub(crate) fn flush_meta_outputs(&mut self) -> Result<(), TincdError> {
+        let ids = self
+            .meta_connections
+            .iter()
+            .map(|connection| connection.id)
+            .collect::<Vec<_>>();
+
+        for id in ids {
+            let Some(index) = self.connection_index_by_id(id) else {
+                continue;
+            };
             match self.flush_meta_output(index) {
-                Ok(()) => index += 1,
-                Err(_) => self.close_meta_connection(index)?,
+                Ok(()) => {
+                    if let Some(index) = self.connection_index_by_id(id)
+                        && self.meta_connections[index].close_requested
+                        && !self.meta_connections[index].has_pending_output()
+                    {
+                        self.close_meta_connection_for_reason(
+                            index,
+                            "close-requested-after-flush",
+                        )?;
+                    }
+                }
+                Err(error) => {
+                    self.close_meta_connection_with_detail(index, "meta-flush-error", error)?
+                }
             }
         }
 
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn flush_meta_output(&mut self, index: usize) -> Result<(), TincdError> {
-        self.meta_connections[index]
-            .flush_meta_output()
-            .map_err(listen_io)
+        let Some(connection) = self.meta_connections.get_mut(index) else {
+            return Ok(());
+        };
+        connection.flush_meta_output().map_err(listen_io)
+    }
+
+    pub(crate) fn flush_meta_output_by_id(
+        &mut self,
+        id: u64,
+    ) -> Result<RuntimeIoProgress, TincdError> {
+        let Some(index) = self.connection_index_by_id(id) else {
+            return Ok(RuntimeIoProgress::NotReady);
+        };
+        match self.meta_connections[index].flush_meta_output_once() {
+            Ok(progress) => {
+                if let Some(index) = self.connection_index_by_id(id)
+                    && self.meta_connections[index].close_requested
+                    && !self.meta_connections[index].has_pending_output()
+                {
+                    self.close_meta_connection_for_reason(
+                        index,
+                        "close-requested-after-flush-once",
+                    )?;
+                    return Ok(RuntimeIoProgress::Processed);
+                }
+                Ok(progress)
+            }
+            Err(error) => {
+                self.close_meta_connection_with_detail(index, "meta-flush-once-error", error)?;
+                Ok(RuntimeIoProgress::Processed)
+            }
+        }
+    }
+}
+
+pub(crate) fn ping_timeout_duration(config: &RuntimeConfig) -> Duration {
+    Duration::from_secs(config.daemon.ping_timeout.max(1) as u64)
+}
+
+#[cfg(target_os = "linux")]
+fn socket_addr_from_storage(storage: &libc::sockaddr_storage) -> Option<SocketAddr> {
+    match storage.ss_family as libc::c_int {
+        libc::AF_INET => {
+            let addr = unsafe { &*(storage as *const _ as *const libc::sockaddr_in) };
+            Some(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::from(addr.sin_addr.s_addr.to_ne_bytes())),
+                u16::from_be(addr.sin_port),
+            ))
+        }
+        libc::AF_INET6 => {
+            let addr = unsafe { &*(storage as *const _ as *const libc::sockaddr_in6) };
+            Some(SocketAddr::V6(std::net::SocketAddrV6::new(
+                Ipv6Addr::from(addr.sin6_addr.s6_addr),
+                u16::from_be(addr.sin6_port),
+                addr.sin6_flowinfo,
+                addr.sin6_scope_id,
+            )))
+        }
+        _ => None,
     }
 }

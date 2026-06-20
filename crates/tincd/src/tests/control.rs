@@ -133,7 +133,7 @@ fn control_request_lines_return_tinc_control_responses() {
 }
 
 #[test]
-fn control_log_request_streams_filtered_runtime_log_entries() {
+fn control_log_request_without_live_stream_replays_no_history_like_tinc() {
     tinc_test_support::assert_can_create_netns();
     let confbase = temp_confbase("control-log-runtime");
     let alpha_key = test_key(1);
@@ -171,10 +171,7 @@ fn control_log_request_streams_filtered_runtime_log_entries() {
     let output = String::from_utf8(response.bytes).unwrap();
 
     assert!(response.close_after_write);
-    assert!(output.contains("18 15 "));
-    assert!(output.contains("ERROR"));
-    assert!(output.contains("visible control log"));
-    assert!(!output.contains("hidden control log"));
+    assert!(output.is_empty());
     assert!(!stop);
 
     fs::remove_dir_all(confbase).unwrap();
@@ -193,8 +190,6 @@ fn control_debug_request_returns_old_level_and_updates_runtime_like_tinc() {
         peer_rsa_public_keys: BTreeMap::new(),
     };
     let mut runtime = RuntimeDaemonState::new(Vec::new(), &config, keys);
-    runtime.record_log(2, "low level log");
-    runtime.record_log(4, "high level log");
 
     let mut stop = false;
     assert_eq!(
@@ -208,30 +203,6 @@ fn control_debug_request_returns_old_level_and_updates_runtime_like_tinc() {
         handle_control_request_line("18 9 -1", &mut stop, Some(&config), Some(&mut runtime))
     );
     assert_eq!(3, runtime.debug_level());
-
-    let response = handle_control_stream_request_line_mut(
-        "18 15 -1 0",
-        &mut stop,
-        None,
-        Some(&mut runtime),
-        None,
-    )
-    .unwrap();
-    let output = String::from_utf8(response.bytes).unwrap();
-    assert!(output.contains("low level log"));
-    assert!(!output.contains("high level log"));
-
-    let response = handle_control_stream_request_line_mut(
-        "18 15 5 0",
-        &mut stop,
-        None,
-        Some(&mut runtime),
-        None,
-    )
-    .unwrap();
-    let output = String::from_utf8(response.bytes).unwrap();
-    assert!(output.contains("low level log"));
-    assert!(output.contains("high level log"));
 }
 
 #[test]
@@ -303,6 +274,7 @@ fn control_connect_request_is_invalid_like_c_control_h() {
         return;
     };
     beta_connection.id = 1;
+    beta_connection.edge_peer = Some("beta".to_owned());
     gamma_connection.id = 2;
     runtime.meta_connections.push(beta_connection);
     runtime.meta_connections.push(gamma_connection);
@@ -361,13 +333,18 @@ fn control_connect_request_is_invalid_like_c_control_h() {
         edges_after.contains(" beta alpha "),
         "C terminate_connection() keeps the reverse edge while the peer remains reachable through other paths"
     );
-    let events = read_meta_events_until(&mut gamma_stream, &mut gamma_driver, |event| {
-        matches!(
-            event,
-            MetaConnectionEvent::Message(MetaMessage::DeleteEdge(message))
-                if message.from == "alpha" && message.to == "beta"
-        )
-    });
+    let events = flush_then_read_meta_events_until(
+        &mut runtime,
+        &mut gamma_stream,
+        &mut gamma_driver,
+        |event| {
+            matches!(
+                event,
+                MetaConnectionEvent::Message(MetaMessage::DeleteEdge(message))
+                    if message.from == "alpha" && message.to == "beta"
+            )
+        },
+    );
     assert!(
         events.iter().any(|event| {
             matches!(
@@ -424,6 +401,7 @@ fn control_disconnect_cleans_reverse_edge_only_after_peer_unreachable_like_tinc(
         return;
     };
     beta_connection.id = 1;
+    beta_connection.edge_peer = Some("beta".to_owned());
     gamma_connection.id = 2;
     runtime.meta_connections.push(beta_connection);
     runtime.meta_connections.push(gamma_connection);
@@ -450,13 +428,18 @@ fn control_disconnect_cleans_reverse_edge_only_after_peer_unreachable_like_tinc(
         !edges_after.contains(" beta alpha "),
         "C terminate_connection() removes the stale reverse edge after the peer becomes unreachable"
     );
-    let events = read_meta_events_until(&mut gamma_stream, &mut gamma_driver, |event| {
-        matches!(
-            event,
-            MetaConnectionEvent::Message(MetaMessage::DeleteEdge(message))
-                if message.from == "beta" && message.to == "alpha"
-        )
-    });
+    let events = flush_then_read_meta_events_until(
+        &mut runtime,
+        &mut gamma_stream,
+        &mut gamma_driver,
+        |event| {
+            matches!(
+                event,
+                MetaConnectionEvent::Message(MetaMessage::DeleteEdge(message))
+                    if message.from == "beta" && message.to == "alpha"
+            )
+        },
+    );
     assert!(
         events.iter().any(|event| {
             matches!(
@@ -522,6 +505,7 @@ fn control_disconnect_tunnel_server_removes_edges_without_broadcast_like_tinc() 
         return;
     };
     beta_connection.id = 1;
+    beta_connection.edge_peer = Some("beta".to_owned());
     gamma_connection.id = 2;
     runtime.meta_connections.push(beta_connection);
     runtime.meta_connections.push(gamma_connection);
@@ -545,12 +529,17 @@ fn control_disconnect_tunnel_server_removes_edges_without_broadcast_like_tinc() 
         handle_control_request_line("18 4", &mut stop, Some(&config), Some(&mut runtime)).unwrap();
     assert!(!edges_after.contains(" alpha beta "));
     assert!(!edges_after.contains(" beta alpha "));
-    let events = read_meta_events_until(&mut gamma_stream, &mut gamma_driver, |event| {
-        matches!(
-            event,
-            MetaConnectionEvent::Message(MetaMessage::DeleteEdge(_))
-        )
-    });
+    let events = flush_then_read_meta_events_until(
+        &mut runtime,
+        &mut gamma_stream,
+        &mut gamma_driver,
+        |event| {
+            matches!(
+                event,
+                MetaConnectionEvent::Message(MetaMessage::DeleteEdge(_))
+            )
+        },
+    );
     assert!(
         !events.iter().any(|event| {
             matches!(
@@ -631,13 +620,18 @@ fn runtime_remote_del_edge_cleans_stale_reverse_edge_like_tinc() {
     );
     assert!(!runtime.state.graph.node("gamma").unwrap().status.reachable);
 
-    let events = read_meta_events_until(&mut delta_stream, &mut delta_driver, |event| {
-        matches!(
-            event,
-            MetaConnectionEvent::Message(MetaMessage::DeleteEdge(message))
-                if message.from == "gamma" && message.to == "alpha"
-        )
-    });
+    let events = flush_then_read_meta_events_until(
+        &mut runtime,
+        &mut delta_stream,
+        &mut delta_driver,
+        |event| {
+            matches!(
+                event,
+                MetaConnectionEvent::Message(MetaMessage::DeleteEdge(message))
+                    if message.from == "gamma" && message.to == "alpha"
+            )
+        },
+    );
     assert!(
         events.iter().any(|event| {
             matches!(
@@ -704,16 +698,21 @@ fn runtime_duplicate_contradicting_add_edge_is_seen_before_correction_like_tinc(
     beta_stream.write_all(&chunk).unwrap();
     runtime.poll_once().unwrap();
 
-    let first = read_meta_events_until(&mut beta_stream, &mut beta_driver, |event| {
-        matches!(
-            event,
-            MetaConnectionEvent::Message(MetaMessage::AddEdge(message))
-                if message.edge.from == "alpha"
-                    && message.edge.to == "beta"
-                    && message.address == "127.0.0.1"
-                    && message.edge.weight == 7
-        )
-    });
+    let first = flush_then_read_meta_events_until(
+        &mut runtime,
+        &mut beta_stream,
+        &mut beta_driver,
+        |event| {
+            matches!(
+                event,
+                MetaConnectionEvent::Message(MetaMessage::AddEdge(message))
+                    if message.edge.from == "alpha"
+                        && message.edge.to == "beta"
+                        && message.address == "127.0.0.1"
+                        && message.edge.weight == 7
+            )
+        },
+    );
     assert!(
         first.iter().any(|event| {
             matches!(
@@ -731,13 +730,18 @@ fn runtime_duplicate_contradicting_add_edge_is_seen_before_correction_like_tinc(
     let duplicate = beta_driver.send_meta_message(&contradiction).unwrap();
     beta_stream.write_all(&duplicate).unwrap();
     runtime.poll_once().unwrap();
-    let duplicate_events = read_meta_events_until(&mut beta_stream, &mut beta_driver, |event| {
-        matches!(
-            event,
-            MetaConnectionEvent::Message(MetaMessage::AddEdge(message))
-                if message.edge.from == "alpha" && message.edge.to == "beta"
-        )
-    });
+    let duplicate_events = flush_then_read_meta_events_until(
+        &mut runtime,
+        &mut beta_stream,
+        &mut beta_driver,
+        |event| {
+            matches!(
+                event,
+                MetaConnectionEvent::Message(MetaMessage::AddEdge(message))
+                    if message.edge.from == "alpha" && message.edge.to == "beta"
+            )
+        },
+    );
     assert!(
         !duplicate_events.iter().any(|event| {
             matches!(
@@ -747,6 +751,105 @@ fn runtime_duplicate_contradicting_add_edge_is_seen_before_correction_like_tinc(
             )
         }),
         "C add_edge_h() calls seen_request() before sending correction for an already seen contradiction"
+    );
+
+    fs::remove_dir_all(confbase).unwrap();
+}
+
+#[test]
+fn runtime_closing_connection_without_owned_edge_keeps_current_edge_like_tinc() {
+    tinc_test_support::assert_can_create_netns();
+    let confbase = temp_confbase("runtime-close-unowned-edge");
+    let alpha_key = test_key(1);
+    let beta_key = test_key(2);
+    fs::write(confbase.join("tinc.conf"), "Name = alpha\n").unwrap();
+    fs::write(
+        confbase.join("hosts").join("alpha"),
+        "Subnet = 10.0.0.0/8\n",
+    )
+    .unwrap();
+
+    let mut options = TincdOptions::new("tincd".to_owned());
+    options.confbase = Some(confbase.clone());
+    let config = load_runtime_config(&options).unwrap();
+    let keys = RuntimeKeys {
+        private_key: Some(alpha_key.clone()),
+        peer_public_keys: BTreeMap::from([("beta".to_owned(), beta_key.public_key())]),
+        rsa_private_key: None,
+        peer_rsa_public_keys: BTreeMap::new(),
+    };
+    let mut runtime = RuntimeDaemonState::new(Vec::new(), &config, keys);
+    let Some((_beta_stream, _beta_driver, mut beta_connection)) =
+        active_runtime_connection("beta", alpha_key, beta_key)
+    else {
+        fs::remove_dir_all(confbase).unwrap();
+        return;
+    };
+    beta_connection.id = 1;
+    assert!(
+        beta_connection.edge_peer.is_none(),
+        "test helper should model an authenticated connection before ACK-created edge ownership"
+    );
+    runtime.meta_connections.push(beta_connection);
+    runtime
+        .apply_runtime_meta_message(
+            parse_meta_message("12 1 alpha beta 127.0.0.1 655 0 7").unwrap(),
+        )
+        .unwrap();
+
+    runtime.close_meta_connection(0).unwrap();
+
+    assert!(
+        runtime.state.graph.edge("alpha", "beta").is_some(),
+        "C terminate_connection() only deletes c->edge; closing a connection without an owned edge must not delete the current local edge"
+    );
+
+    fs::remove_dir_all(confbase).unwrap();
+}
+
+#[test]
+fn runtime_closing_connection_with_owned_edge_deletes_that_edge_like_tinc() {
+    tinc_test_support::assert_can_create_netns();
+    let confbase = temp_confbase("runtime-close-owned-edge");
+    let alpha_key = test_key(1);
+    let beta_key = test_key(2);
+    fs::write(confbase.join("tinc.conf"), "Name = alpha\n").unwrap();
+    fs::write(
+        confbase.join("hosts").join("alpha"),
+        "Subnet = 10.0.0.0/8\n",
+    )
+    .unwrap();
+
+    let mut options = TincdOptions::new("tincd".to_owned());
+    options.confbase = Some(confbase.clone());
+    let config = load_runtime_config(&options).unwrap();
+    let keys = RuntimeKeys {
+        private_key: Some(alpha_key.clone()),
+        peer_public_keys: BTreeMap::from([("beta".to_owned(), beta_key.public_key())]),
+        rsa_private_key: None,
+        peer_rsa_public_keys: BTreeMap::new(),
+    };
+    let mut runtime = RuntimeDaemonState::new(Vec::new(), &config, keys);
+    let Some((_beta_stream, _beta_driver, mut beta_connection)) =
+        active_runtime_connection("beta", alpha_key, beta_key)
+    else {
+        fs::remove_dir_all(confbase).unwrap();
+        return;
+    };
+    beta_connection.id = 1;
+    beta_connection.edge_peer = Some("beta".to_owned());
+    runtime.meta_connections.push(beta_connection);
+    runtime
+        .apply_runtime_meta_message(
+            parse_meta_message("12 1 alpha beta 127.0.0.1 655 0 7").unwrap(),
+        )
+        .unwrap();
+
+    runtime.close_meta_connection(0).unwrap();
+
+    assert!(
+        runtime.state.graph.edge("alpha", "beta").is_none(),
+        "C terminate_connection() removes the edge owned by the closed connection"
     );
 
     fs::remove_dir_all(confbase).unwrap();
@@ -818,14 +921,19 @@ fn runtime_strict_subnets_forwards_but_ignores_remote_add_subnet_like_tinc() {
         "C add_subnet_h() creates the owner node before the StrictSubnets ignore branch"
     );
 
-    let events = read_meta_events_until(&mut gamma_stream, &mut gamma_driver, |event| {
-        matches!(
-            event,
-            MetaConnectionEvent::Message(MetaMessage::AddSubnet(message))
-                if message.owner == "beta"
-                    && message.subnet == "10.77.0.0/16".parse().unwrap()
-        )
-    });
+    let events = flush_then_read_meta_events_until(
+        &mut runtime,
+        &mut gamma_stream,
+        &mut gamma_driver,
+        |event| {
+            matches!(
+                event,
+                MetaConnectionEvent::Message(MetaMessage::AddSubnet(message))
+                    if message.owner == "beta"
+                        && message.subnet == "10.77.0.0/16".parse().unwrap()
+            )
+        },
+    );
     assert!(
         events.iter().any(|event| {
             matches!(
@@ -923,14 +1031,19 @@ fn runtime_strict_subnets_syncs_forwarded_unauthorized_subnet_to_late_peer_like_
         )
         .unwrap();
 
-    let events = read_meta_events_until(&mut gamma_stream, &mut gamma_driver, |event| {
-        matches!(
-            event,
-            MetaConnectionEvent::Message(MetaMessage::AddSubnet(message))
-                if message.owner == "beta"
-                    && message.subnet == "10.77.0.0/16".parse().unwrap()
-        )
-    });
+    let events = flush_then_read_meta_events_until(
+        &mut runtime,
+        &mut gamma_stream,
+        &mut gamma_driver,
+        |event| {
+            matches!(
+                event,
+                MetaConnectionEvent::Message(MetaMessage::AddSubnet(message))
+                    if message.owner == "beta"
+                        && message.subnet == "10.77.0.0/16".parse().unwrap()
+            )
+        },
+    );
     assert!(
         events.iter().any(|event| matches!(
             event,
@@ -1019,14 +1132,19 @@ fn runtime_strict_subnets_forwards_but_ignores_remote_del_subnet_like_tinc() {
         "C del_subnet_h() forwards but does not delete known subnets when StrictSubnets is enabled"
     );
 
-    let events = read_meta_events_until(&mut gamma_stream, &mut gamma_driver, |event| {
-        matches!(
-            event,
-            MetaConnectionEvent::Message(MetaMessage::DeleteSubnet(message))
-                if message.owner == "beta"
-                    && message.subnet == "10.77.0.0/16".parse().unwrap()
-        )
-    });
+    let events = flush_then_read_meta_events_until(
+        &mut runtime,
+        &mut gamma_stream,
+        &mut gamma_driver,
+        |event| {
+            matches!(
+                event,
+                MetaConnectionEvent::Message(MetaMessage::DeleteSubnet(message))
+                    if message.owner == "beta"
+                        && message.subnet == "10.77.0.0/16".parse().unwrap()
+            )
+        },
+    );
     assert!(
         events.iter().any(|event| {
             matches!(
@@ -1085,6 +1203,7 @@ fn runtime_activation_closes_duplicate_connection_without_del_edge_like_tinc() {
         return;
     };
     old_beta_connection.id = 1;
+    old_beta_connection.edge_peer = Some("beta".to_owned());
     new_beta_connection.id = 2;
     gamma_connection.id = 3;
     runtime.meta_connections.push(old_beta_connection);
@@ -1134,15 +1253,20 @@ fn runtime_activation_closes_duplicate_connection_without_del_edge_like_tinc() {
         "the new ACK activation recreates alpha->beta after closing the old connection"
     );
 
-    let events = read_meta_events_until(&mut gamma_stream, &mut gamma_driver, |event| {
-        matches!(
-            event,
-            MetaConnectionEvent::Message(MetaMessage::AddEdge(message))
-                if message.edge.from == "alpha"
-                    && message.edge.to == "beta"
-                    && message.port == "1665"
-        )
-    });
+    let events = flush_then_read_meta_events_until(
+        &mut runtime,
+        &mut gamma_stream,
+        &mut gamma_driver,
+        |event| {
+            matches!(
+                event,
+                MetaConnectionEvent::Message(MetaMessage::AddEdge(message))
+                    if message.edge.from == "alpha"
+                        && message.edge.to == "beta"
+                        && message.port == "1665"
+            )
+        },
+    );
     assert!(
         !events.iter().any(|event| {
             matches!(
@@ -1205,6 +1329,7 @@ fn runtime_duplicate_activation_keeps_current_index_for_followup_messages_like_t
         return;
     };
     old_beta_connection.id = 1;
+    old_beta_connection.edge_peer = Some("beta".to_owned());
     new_beta_connection.id = 2;
     runtime.meta_connections.push(old_beta_connection);
     runtime.meta_connections.push(new_beta_connection);
@@ -1248,13 +1373,18 @@ fn runtime_duplicate_activation_keeps_current_index_for_followup_messages_like_t
             .is_some(),
         "C ack_h() keeps processing later requests on the newly activated duplicate connection"
     );
-    let events = read_meta_events_until(&mut new_beta_stream, &mut new_beta_driver, |event| {
-        matches!(
-            event,
-            MetaConnectionEvent::Message(MetaMessage::AddEdge(message))
-                if message.edge.from == "alpha" && message.edge.to == "beta"
-        )
-    });
+    let events = flush_then_read_meta_events_until(
+        &mut runtime,
+        &mut new_beta_stream,
+        &mut new_beta_driver,
+        |event| {
+            matches!(
+                event,
+                MetaConnectionEvent::Message(MetaMessage::AddEdge(message))
+                    if message.edge.from == "alpha" && message.edge.to == "beta"
+            )
+        },
+    );
     assert!(
         events.iter().any(|event| {
             matches!(
@@ -1318,7 +1448,8 @@ fn control_retry_request_forces_configured_peer_reconnect_attempt() {
     };
     let mut runtime = RuntimeDaemonState::new(Vec::new(), &config, keys);
 
-    assert_eq!(0, runtime.retry_configured_peers(&config).unwrap());
+    assert_eq!(1, runtime.retry_configured_peers(&config).unwrap());
+    drive_until_no_meta_connections(&mut runtime);
 
     let remote_listener = match TcpListener::bind(remote_addr) {
         Ok(listener) => listener,
@@ -1336,7 +1467,8 @@ fn control_retry_request_forces_configured_peer_reconnect_attempt() {
         handle_control_request_line("18 10", &mut stop, Some(&config), Some(&mut runtime))
     );
 
-    let (remote_stream, _) = remote_listener.accept().unwrap();
+    let (remote_stream, _) = accept_after_runtime_progress(&remote_listener, &mut runtime);
+    drive_outgoing_meta_output(&mut runtime);
     let mut reader = BufReader::new(remote_stream);
     let mut line = String::new();
     reader.read_line(&mut line).unwrap();
@@ -1483,7 +1615,8 @@ fn control_reload_request_rereads_config_and_retries_new_connect_to() {
         )
     );
 
-    let (remote_stream, _) = remote_listener.accept().unwrap();
+    let (remote_stream, _) = accept_after_runtime_progress(&remote_listener, &mut runtime);
+    drive_outgoing_meta_output(&mut runtime);
     let mut reader = BufReader::new(remote_stream);
     let mut line = String::new();
     reader.read_line(&mut line).unwrap();
@@ -1690,9 +1823,9 @@ fn control_node_dump_includes_runtime_fields_like_tinc() {
     let fields = beta_line.split_whitespace().collect::<Vec<_>>();
 
     assert_eq!(25, fields.len());
-    assert_eq!("192.0.2.7", fields[4]);
+    assert_eq!("unknown", fields[4]);
     assert_eq!("port", fields[5]);
-    assert_eq!("777", fields[6]);
+    assert_eq!("unknown", fields[6]);
     assert_eq!("419", fields[7]);
     assert_eq!("672", fields[8]);
     assert_eq!("16", fields[9]);
@@ -2087,6 +2220,13 @@ fn control_log_request_registers_live_stream_like_tinc() {
 
     runtime.record_log_with_priority(4, LOG_WARNING, "future live log");
     runtime.record_log_with_priority(6, LOG_DEBUG, "filtered live log");
+    let subscriber_id = runtime.log_subscribers[0].writer.id;
+    while matches!(
+        runtime
+            .flush_control_subscriber_by_id(subscriber_id)
+            .unwrap(),
+        RuntimeIoProgress::Processed
+    ) {}
 
     line.clear();
     reader.read_line(&mut line).unwrap();
@@ -2173,6 +2313,13 @@ fn control_pcap_request_registers_live_stream_like_tinc() {
     assert_eq!(1, runtime.pcap_subscribers.len());
 
     runtime.capture_control_pcap_packet(&VpnPacket::new(vec![1, 2, 3, 4, 5]).unwrap());
+    let subscriber_id = runtime.pcap_subscribers[0].writer.id;
+    while matches!(
+        runtime
+            .flush_control_subscriber_by_id(subscriber_id)
+            .unwrap(),
+        RuntimeIoProgress::Processed
+    ) {}
 
     line.clear();
     reader.read_line(&mut line).unwrap();
@@ -2186,7 +2333,7 @@ fn control_pcap_request_registers_live_stream_like_tinc() {
 
 #[cfg(unix)]
 #[test]
-fn control_pcap_slow_subscriber_is_dropped_without_blocking_runtime_like_tinc() {
+fn control_dump_connections_includes_live_streams_like_tinc() {
     tinc_test_support::assert_can_create_netns();
     let config = RuntimeConfig::from_config_tree(&config_tree(&[("Name", "alpha")])).unwrap();
     let keys = RuntimeKeys {
@@ -2196,33 +2343,200 @@ fn control_pcap_slow_subscriber_is_dropped_without_blocking_runtime_like_tinc() 
         peer_rsa_public_keys: BTreeMap::new(),
     };
     let mut runtime = RuntimeDaemonState::new(Vec::new(), &config, keys);
-    let (sender, receiver) = mpsc::sync_channel(CONTROL_SUBSCRIBER_QUEUE_CAPACITY);
+    let (pcap_server, _pcap_client) = std::os::unix::net::UnixStream::pair().unwrap();
     runtime
-        .pcap_subscribers
-        .push(RuntimeControlPcapSubscriber { snaplen: 2, sender });
+        .register_control_pcap_subscriber(128, RuntimeControlSubscriberStream::Unix(pcap_server))
+        .unwrap();
+    let pcap_id = runtime.pcap_subscribers[0].writer.id;
+    let (log_server, _log_client) = std::os::unix::net::UnixStream::pair().unwrap();
+    runtime
+        .register_control_log_subscriber(
+            DEBUG_PROTOCOL,
+            true,
+            RuntimeControlSubscriberStream::Unix(log_server),
+        )
+        .unwrap();
+    let log_id = runtime.log_subscribers[0].writer.id;
 
-    for index in 0..=CONTROL_SUBSCRIBER_QUEUE_CAPACITY {
+    let dump = dump_connections(Some(&runtime));
+    assert!(dump.contains("18 6 <control> localhost port unix 0 0 200\n"));
+    assert!(
+        dump.contains(&format!(
+            "18 6 <control> localhost port unix 0 {pcap_id} 600\n"
+        )),
+        "pcap live control connection must be visible like C tinc: {dump}"
+    );
+    assert!(
+        dump.contains(&format!(
+            "18 6 <control> localhost port unix 0 {log_id} a00\n"
+        )),
+        "log live control connection must be visible like C tinc: {dump}"
+    );
+    assert!(dump.ends_with("18 6\n"));
+}
+
+#[cfg(unix)]
+#[test]
+fn control_pcap_slow_subscriber_buffers_like_tinc_meta_outbuf() {
+    tinc_test_support::assert_can_create_netns();
+    let config = RuntimeConfig::from_config_tree(&config_tree(&[("Name", "alpha")])).unwrap();
+    let keys = RuntimeKeys {
+        private_key: Some(test_key(1)),
+        peer_public_keys: BTreeMap::new(),
+        rsa_private_key: None,
+        peer_rsa_public_keys: BTreeMap::new(),
+    };
+    let mut runtime = RuntimeDaemonState::new(Vec::new(), &config, keys);
+    let (server, _client) = std::os::unix::net::UnixStream::pair().unwrap();
+    let subscriber_id = runtime.next_control_subscriber_id();
+    runtime.pcap_subscribers.push(RuntimeControlPcapSubscriber {
+        snaplen: 2,
+        writer: RuntimeControlSubscriberWriter::new(
+            subscriber_id,
+            RuntimeControlSubscriberStream::Unix(server),
+        )
+        .unwrap(),
+    });
+
+    for index in 0..512 {
         runtime.capture_control_pcap_packet(
             &VpnPacket::new(vec![index as u8, 0xaa, 0xbb, 0xcc]).unwrap(),
         );
     }
 
-    assert!(
-        runtime.pcap_subscribers.is_empty(),
-        "C send_pcap() relies on meta write failure to drop dead/slow control clients; Rust must not block the daemon when the bounded live pcap queue fills"
-    );
+    assert_eq!(1, runtime.pcap_subscribers.len());
+    let buffered = &runtime.pcap_subscribers[0].writer.outbound;
     assert_eq!(
-        CONTROL_SUBSCRIBER_QUEUE_CAPACITY,
-        receiver.try_iter().count(),
-        "the slow subscriber keeps only the bounded backlog accepted before TrySendError::Full"
+        512,
+        buffered
+            .windows(b"18 14 2\n".len())
+            .filter(|chunk| *chunk == b"18 14 2\n")
+            .count()
     );
 
     runtime.capture_control_pcap_packet(&VpnPacket::new(vec![9, 8, 7, 6]).unwrap());
+    assert_eq!(1, runtime.pcap_subscribers.len());
+}
+
+#[test]
+fn topology_contradiction_backoff_matches_tinc_periodic_handler() {
+    tinc_test_support::assert_can_create_netns();
+    let config = RuntimeConfig::from_config_tree(&config_tree(&[("Name", "alpha")])).unwrap();
+    let keys = RuntimeKeys {
+        private_key: Some(test_key(1)),
+        peer_public_keys: BTreeMap::new(),
+        rsa_private_key: None,
+        peer_rsa_public_keys: BTreeMap::new(),
+    };
+    let mut runtime = RuntimeDaemonState::new(Vec::new(), &config, keys);
+    let now = Instant::now();
+
+    for _ in 0..=TOPOLOGY_CONTRADICTION_LIMIT {
+        runtime.topology_backoff.note_add_edge();
+        runtime.topology_backoff.note_del_edge();
+    }
+
+    runtime.apply_topology_backoff_periodic_check(now);
     assert_eq!(
-        Some(vec![9, 8, 7, 6]),
-        runtime.pcap_packets.back().cloned(),
-        "pcap ring capture continues after the slow live subscriber is removed"
+        Some(now + TOPOLOGY_BACKOFF_MIN),
+        runtime.topology_backoff.until
     );
+    assert_eq!(TOPOLOGY_BACKOFF_MIN * 2, runtime.topology_backoff.delay);
+
+    runtime.apply_topology_backoff_periodic_check(now + AUTOCONNECT_INTERVAL);
+    assert_eq!(
+        Some(now + TOPOLOGY_BACKOFF_MIN),
+        runtime.topology_backoff.until
+    );
+    assert!(runtime.topology_backoff.active(now + AUTOCONNECT_INTERVAL));
+
+    for _ in 0..=TOPOLOGY_CONTRADICTION_LIMIT {
+        runtime.topology_backoff.note_add_edge();
+        runtime.topology_backoff.note_del_edge();
+    }
+    runtime
+        .apply_topology_backoff_periodic_check(now + TOPOLOGY_BACKOFF_MIN + AUTOCONNECT_INTERVAL);
+    assert_eq!(
+        Some(now + TOPOLOGY_BACKOFF_MIN + AUTOCONNECT_INTERVAL + TOPOLOGY_BACKOFF_MIN * 2),
+        runtime.topology_backoff.until
+    );
+    assert_eq!(TOPOLOGY_BACKOFF_MIN * 4, runtime.topology_backoff.delay);
+}
+
+#[test]
+fn runtime_periodic_timer_matches_tinc_zero_start_and_jittered_reschedule() {
+    tinc_test_support::assert_can_create_netns();
+    let config = RuntimeConfig::from_config_tree(&config_tree(&[("Name", "alpha")])).unwrap();
+    let keys = RuntimeKeys {
+        private_key: Some(test_key(1)),
+        peer_public_keys: BTreeMap::new(),
+        rsa_private_key: None,
+        peer_rsa_public_keys: BTreeMap::new(),
+    };
+    let mut runtime = RuntimeDaemonState::new(Vec::new(), &config, keys);
+    let before = Instant::now();
+
+    assert!(
+        runtime.next_tinc_periodic <= before,
+        "C adds the periodic timer with {{0, 0}}, so the first run is immediately due"
+    );
+    assert_eq!(0, runtime.run_tinc_periodic_once(Some(&config)).unwrap());
+    let delay = runtime.next_tinc_periodic.saturating_duration_since(before);
+    assert!(
+        delay >= AUTOCONNECT_INTERVAL
+            && delay < AUTOCONNECT_INTERVAL + StdDuration::from_micros(TINC_TIMER_JITTER_US as u64),
+        "C reschedules periodic_handler after 5 seconds plus jitter()"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn topology_backoff_suspends_meta_reads_without_closing_connection() {
+    tinc_test_support::assert_can_create_netns();
+    let config = RuntimeConfig::from_config_tree(&config_tree(&[("Name", "alpha")])).unwrap();
+    let keys = RuntimeKeys {
+        private_key: Some(test_key(1)),
+        peer_public_keys: BTreeMap::new(),
+        rsa_private_key: None,
+        peer_rsa_public_keys: BTreeMap::new(),
+    };
+    let mut runtime = RuntimeDaemonState::new(Vec::new(), &config, keys);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut remote = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+    let (stream, peer) = listener.accept().unwrap();
+    stream.set_nonblocking(true).unwrap();
+    let local = stream.local_addr().unwrap();
+    runtime.meta_connections.push(RuntimeMetaConnection {
+        id: 1,
+        stream,
+        peer,
+        local,
+        bytes_read: 0,
+        bytes_written: 0,
+        outbound: Vec::new(),
+        outbound_offset: 0,
+        status: CONNECTION_STATUS_ACTIVE,
+        options: 0,
+        outgoing_peer: None,
+        outgoing_autoconnect: false,
+        connecting: false,
+        close_requested: false,
+        last_activity: Instant::now(),
+        last_ping_time: Instant::now(),
+        last_ping_sent: None,
+        edge_peer: None,
+        exec_proxy: None,
+        kind: RuntimeMetaConnectionKind::PendingIncoming { buffer: Vec::new() },
+    });
+    runtime.topology_backoff.until = Some(Instant::now() + TOPOLOGY_BACKOFF_MIN);
+
+    remote.write_all(b"0 beta 17.7\n").unwrap();
+    assert_eq!(
+        RuntimeIoProgress::NotReady,
+        runtime.read_meta_connection_once_by_id(1).unwrap()
+    );
+    assert_eq!(1, runtime.meta_connections.len());
+    assert_eq!(0, runtime.meta_connections[0].bytes_read);
 }
 
 #[test]

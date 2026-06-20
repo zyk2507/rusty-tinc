@@ -1,5 +1,8 @@
 use crate::*;
 
+#[cfg(all(unix, feature = "vde"))]
+use tinc_core::route::ETH_HLEN;
+
 #[derive(Debug)]
 pub(crate) enum RuntimeDevice {
     Dummy(DummyDevice),
@@ -71,6 +74,19 @@ impl RuntimeDevice {
             Self::Vde(_) => Err(TincdError::RuntimeState(
                 "cannot inject test packet into runtime device".to_owned(),
             )),
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn poll_fd(&self) -> Option<RawFd> {
+        match self {
+            Self::Dummy(_) | Self::Memory(_) => None,
+            Self::File(device) => Some(device.as_raw_fd()),
+            Self::Multicast(device) => Some(device.socket.as_raw_fd()),
+            #[cfg(target_os = "linux")]
+            Self::Uml(device) => device.poll_fd(),
+            #[cfg(all(unix, feature = "vde"))]
+            Self::Vde(device) => device.poll_fd(),
         }
     }
 }
@@ -230,6 +246,13 @@ impl Device for MulticastDevice {
         self.socket.send_to(&packet.data, self.target)?;
         self.ignore_src.copy_from_slice(source);
         Ok(())
+    }
+}
+
+#[cfg(unix)]
+impl AsRawFd for MulticastDevice {
+    fn as_raw_fd(&self) -> RawFd {
+        self.socket.as_raw_fd()
     }
 }
 
@@ -508,9 +531,10 @@ pub(crate) fn open_vde_device(
 #[cfg(all(unix, feature = "vde"))]
 #[link(name = "vdeplug")]
 unsafe extern "C" {
-    fn vde_open(
+    fn vde_open_real(
         vde_switch: *const libc::c_char,
         descr: *const libc::c_char,
+        interface_version: libc::c_int,
         open_args: *mut VdeOpenArgs,
     ) -> *mut VdeConnection;
     fn vde_close(conn: *mut VdeConnection) -> libc::c_int;
@@ -530,6 +554,9 @@ unsafe extern "C" {
 }
 
 #[cfg(all(unix, feature = "vde"))]
+const LIBVDEPLUG_INTERFACE_VERSION: libc::c_int = 1;
+
+#[cfg(all(unix, feature = "vde"))]
 #[repr(C)]
 pub(crate) struct VdeOpenArgs {
     pub(crate) port: libc::c_int,
@@ -546,6 +573,12 @@ pub(crate) struct VdeDevice {
     pub(crate) info: DeviceInfo,
     pub(crate) conn: *mut VdeConnection,
 }
+
+#[cfg(all(unix, feature = "vde"))]
+// SAFETY: VdeDevice uniquely owns the libvdeplug connection handle. It is not
+// Clone or Sync, and all operations that touch the handle require &mut self or
+// Drop, so moving it to another thread preserves exclusive access.
+unsafe impl Send for VdeDevice {}
 
 #[cfg(all(unix, feature = "vde"))]
 impl VdeDevice {
@@ -573,7 +606,14 @@ impl VdeDevice {
                 .map_or(std::ptr::null(), |group| group.as_ptr()),
             mode: 0o700,
         };
-        let conn = unsafe { vde_open(device_c.as_ptr(), local_name_c.as_ptr(), &mut args) };
+        let conn = unsafe {
+            vde_open_real(
+                device_c.as_ptr(),
+                local_name_c.as_ptr(),
+                LIBVDEPLUG_INTERFACE_VERSION,
+                &mut args,
+            )
+        };
 
         if conn.is_null() {
             return Err(TincdError::RuntimeState(format!(
@@ -590,6 +630,11 @@ impl VdeDevice {
             info: DeviceInfo::new(DeviceKind::Vde, device, interface, "VDE socket"),
             conn,
         })
+    }
+
+    pub(crate) fn poll_fd(&self) -> Option<RawFd> {
+        let fd = unsafe { vde_datafd(self.conn) };
+        (fd >= 0).then_some(fd)
     }
 }
 
@@ -789,6 +834,14 @@ impl LinuxUmlDevice {
             data_addr,
             state: LinuxUmlDeviceState::Listen,
         })
+    }
+
+    pub(crate) fn poll_fd(&self) -> Option<RawFd> {
+        match self.state {
+            LinuxUmlDeviceState::Listen => self.listen.as_ref().map(AsRawFd::as_raw_fd),
+            LinuxUmlDeviceState::Request => self.request.as_ref().map(AsRawFd::as_raw_fd),
+            LinuxUmlDeviceState::Connected => Some(self.data.as_raw_fd()),
+        }
     }
 
     pub(crate) fn accept_request(&mut self) -> Result<Option<VpnPacket>, DeviceError> {

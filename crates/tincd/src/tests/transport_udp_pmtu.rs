@@ -127,6 +127,100 @@ fn runtime_try_udp_sends_sptps_probe_request_like_tinc() {
 }
 
 #[test]
+fn runtime_meta_ping_timer_retries_udp_probe_after_recent_meta_activity_like_tinc() {
+    tinc_test_support::assert_can_create_netns();
+    let alpha_socket = match test_runtime_listen_socket() {
+        Ok(socket) => socket,
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return,
+        Err(error) => panic!("failed to bind alpha runtime listener: {error}"),
+    };
+    let beta_socket = match test_runtime_listen_socket() {
+        Ok(socket) => socket,
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return,
+        Err(error) => panic!("failed to bind beta runtime listener: {error}"),
+    };
+    let alpha_addr = alpha_socket.info().address;
+    let beta_addr = beta_socket.info().address;
+    let alpha_key = test_key(1);
+    let beta_key = test_key(2);
+    let alpha_public_key = alpha_key.public_key();
+    let beta_public_key = beta_key.public_key();
+
+    let alpha_server = config_tree(&[
+        ("Name", "alpha"),
+        ("AddressFamily", "IPv4"),
+        ("PingInterval", "1"),
+        ("PingTimeout", "1"),
+        ("UDPDiscoveryInterval", "0"),
+    ]);
+    let beta_address = format!("{} {}", beta_addr.ip(), beta_addr.port());
+    let alpha_beta_host = config_tree(&[("Address", &beta_address)]);
+    let beta_server = config_tree(&[("Name", "beta"), ("AddressFamily", "IPv4")]);
+    let alpha_address = format!("{} {}", alpha_addr.ip(), alpha_addr.port());
+    let beta_alpha_host = config_tree(&[("Address", &alpha_address)]);
+    let alpha_config =
+        RuntimeConfig::from_config_tree_with_hosts(&alpha_server, [("beta", &alpha_beta_host)])
+            .unwrap();
+    let beta_config =
+        RuntimeConfig::from_config_tree_with_hosts(&beta_server, [("alpha", &beta_alpha_host)])
+            .unwrap();
+    let alpha_keys = RuntimeKeys {
+        private_key: Some(alpha_key.clone()),
+        peer_public_keys: BTreeMap::from([("beta".to_owned(), beta_public_key)]),
+        rsa_private_key: None,
+        peer_rsa_public_keys: BTreeMap::new(),
+    };
+    let beta_keys = RuntimeKeys {
+        private_key: Some(beta_key.clone()),
+        peer_public_keys: BTreeMap::from([("alpha".to_owned(), alpha_public_key)]),
+        rsa_private_key: None,
+        peer_rsa_public_keys: BTreeMap::new(),
+    };
+    let Some((_beta_stream, _beta_driver, mut beta_connection)) =
+        active_runtime_connection("beta", alpha_key, beta_key)
+    else {
+        return;
+    };
+    let mut alpha = RuntimeDaemonState::new(vec![alpha_socket], &alpha_config, alpha_keys);
+    let mut beta = RuntimeDaemonState::new(vec![beta_socket], &beta_config, beta_keys);
+
+    let options = (PROT_MINOR as u32) << 24;
+    let alpha_peer = alpha.state.graph.node_mut("beta").unwrap();
+    alpha_peer.status.reachable = true;
+    alpha_peer.status.sptps = true;
+    alpha_peer.options = options;
+    alpha_peer.route.next_hop = Some("beta".to_owned());
+    alpha_peer.route.via = Some("beta".to_owned());
+    let beta_peer = beta.state.graph.node_mut("alpha").unwrap();
+    beta_peer.status.reachable = true;
+    beta_peer.status.sptps = true;
+    beta_peer.options = options;
+    complete_sptps_udp_exchange(&mut alpha, &mut beta);
+
+    beta_connection.id = 11;
+    beta_connection.edge_peer = Some("beta".to_owned());
+    let now = Instant::now();
+    beta_connection.last_activity = now;
+    beta_connection.last_ping_time = now - alpha.ping_timeout;
+    alpha.meta_connections.push(beta_connection);
+    alpha.local_edge_connections.insert("beta".to_owned(), 11);
+    alpha.next_meta_ping_check = now - StdDuration::from_secs(1);
+
+    alpha.run_meta_ping_timer_once_like_tinc().unwrap();
+
+    let payload = recv_sptps_probe_payload(&mut beta, "alpha", alpha_addr);
+    assert_eq!(UDP_PROBE_MIN_SIZE, payload.len());
+    assert!(
+        alpha.state.graph.node("beta").unwrap().status.ping_sent,
+        "C timeout_handler() calls try_tx(..., false) even after recent meta activity"
+    );
+    assert!(
+        alpha.udp_probe["beta"].udp_ping_sent.is_some(),
+        "C try_udp() records a probe in flight from the keepalive pass"
+    );
+}
+
+#[test]
 fn runtime_try_udp_uses_reverse_edge_address_before_latest_guess_like_tinc() {
     tinc_test_support::assert_can_create_netns();
     let alpha_socket = match test_runtime_listen_socket() {
@@ -355,8 +449,16 @@ fn runtime_try_udp_local_discovery_sends_duplicate_to_edge_local_address_like_ti
 #[test]
 fn pmtu_initial_probe_formula_matches_tinc_float_schedule() {
     tinc_test_support::assert_can_create_netns();
-    assert_eq!(1330, pmtu_initial_probe_len(0, DEFAULT_MTU, 0));
-    assert_eq!(826, pmtu_initial_probe_len(0, DEFAULT_MTU, 1));
+    #[cfg(not(feature = "jumbograms"))]
+    {
+        assert_eq!(1330, pmtu_initial_probe_len(0, DEFAULT_MTU, 0));
+        assert_eq!(826, pmtu_initial_probe_len(0, DEFAULT_MTU, 1));
+    }
+    #[cfg(feature = "jumbograms")]
+    {
+        assert_eq!(6996, pmtu_initial_probe_len(0, DEFAULT_MTU, 0));
+        assert_eq!(2362, pmtu_initial_probe_len(0, DEFAULT_MTU, 1));
+    }
     assert_eq!(513, pmtu_initial_probe_len(0, DEFAULT_MTU, 7));
     assert_eq!(900, pmtu_initial_probe_len(0, 900, 0));
 }
@@ -540,6 +642,48 @@ fn runtime_applies_udp_probe_reply_state_like_tinc() {
         Some(Instant::now() - StdDuration::from_secs(1));
     runtime.try_udp_for_peer("beta").unwrap();
 
+    let beta = runtime.state.graph.node("beta").unwrap();
+    assert!(!beta.status.udp_confirmed);
+    assert_eq!(0, beta.min_mtu);
+    assert_eq!(DEFAULT_MTU, beta.max_mtu);
+    assert_eq!(0, beta.mtu_probes);
+}
+
+#[test]
+fn runtime_udp_probe_timeout_expires_from_timer_pass_like_tinc() {
+    tinc_test_support::assert_can_create_netns();
+    let server = config_tree(&[("Name", "alpha")]);
+    let beta_host = config_tree(&[("Address", "127.0.0.1 655")]);
+    let config =
+        RuntimeConfig::from_config_tree_with_hosts(&server, [("beta", &beta_host)]).unwrap();
+    let keys = RuntimeKeys {
+        private_key: Some(test_key(1)),
+        peer_public_keys: BTreeMap::new(),
+        rsa_private_key: None,
+        peer_rsa_public_keys: BTreeMap::new(),
+    };
+    let mut runtime = RuntimeDaemonState::new(Vec::new(), &config, keys);
+    let beta = runtime.state.graph.node_mut("beta").unwrap();
+    beta.status.udp_confirmed = true;
+    beta.min_mtu = 1400;
+    beta.max_mtu = 1400;
+    beta.mtu_probes = -1;
+    runtime.udp_probe.insert(
+        "beta".to_owned(),
+        RuntimeUdpProbeState {
+            udp_ping_timeout: Some(Instant::now() - StdDuration::from_secs(1)),
+            udp_ping_rtt: Some(StdDuration::from_millis(20)),
+            max_recent_len: 1200,
+            ..Default::default()
+        },
+    );
+
+    runtime.run_timers_once_with_periodic(None).unwrap();
+
+    let probe = runtime.udp_probe.get("beta").unwrap();
+    assert_eq!(None, probe.udp_ping_timeout);
+    assert_eq!(None, probe.udp_ping_rtt);
+    assert_eq!(0, probe.max_recent_len);
     let beta = runtime.state.graph.node("beta").unwrap();
     assert!(!beta.status.udp_confirmed);
     assert_eq!(0, beta.min_mtu);
@@ -761,6 +905,7 @@ fn runtime_forwards_udp_and_mtu_info_messages_like_tinc() {
     wire.extend(gamma_driver.send_meta_message(&mtu_info).unwrap());
     gamma_stream.write_all(&wire).unwrap();
     runtime.poll_once().unwrap();
+    runtime.flush_meta_outputs().unwrap();
 
     let mut events = Vec::new();
     let mut buffer = [0u8; 2048];
@@ -853,16 +998,21 @@ fn runtime_udp_info_for_unknown_origin_address_uses_unspec_like_tinc() {
 
     runtime.send_udp_info("beta", "gamma").unwrap();
 
-    let events = read_meta_events_until(&mut gamma_stream, &mut gamma_driver, |event| {
-        matches!(
-            event,
-            MetaConnectionEvent::Message(MetaMessage::UdpInfo(message))
-                if message.from == "beta"
-                    && message.to == "gamma"
-                    && message.endpoint.address == "unspec"
-                    && message.endpoint.port == "unspec"
-        )
-    });
+    let events = flush_then_read_meta_events_until(
+        &mut runtime,
+        &mut gamma_stream,
+        &mut gamma_driver,
+        |event| {
+            matches!(
+                event,
+                MetaConnectionEvent::Message(MetaMessage::UdpInfo(message))
+                    if message.from == "beta"
+                        && message.to == "gamma"
+                        && message.endpoint.address == "unspec"
+                        && message.endpoint.port == "unspec"
+            )
+        },
+    );
     assert!(
         events.iter().any(|event| matches!(
             event,
@@ -954,6 +1104,7 @@ fn runtime_mtu_info_forwarding_uses_best_path_mtu_like_tinc() {
     }
     gamma_stream.write_all(&wire).unwrap();
     runtime.poll_once().unwrap();
+    runtime.flush_meta_outputs().unwrap();
 
     let mut events = Vec::new();
     let mut buffer = [0u8; 2048];
@@ -1078,13 +1229,18 @@ fn runtime_tunnel_server_forwards_mtu_info_only_to_addressed_next_hop_like_tinc(
         .unwrap();
     runtime.poll_once().unwrap();
 
-    let events = read_meta_events_until(&mut gamma_stream, &mut gamma_driver, |event| {
-        matches!(
-            event,
-            MetaConnectionEvent::Message(MetaMessage::MtuInfo(message))
-                if message.from == "beta" && message.to == "gamma" && message.mtu == 1400
-        )
-    });
+    let events = flush_then_read_meta_events_until(
+        &mut runtime,
+        &mut gamma_stream,
+        &mut gamma_driver,
+        |event| {
+            matches!(
+                event,
+                MetaConnectionEvent::Message(MetaMessage::MtuInfo(message))
+                    if message.from == "beta" && message.to == "gamma" && message.mtu == 1400
+            )
+        },
+    );
     assert!(
         events.iter().any(|event| matches!(
             event,
@@ -1142,6 +1298,7 @@ fn runtime_mtu_info_from_unknown_origin_is_not_forwarded_like_tinc() {
         )
         .unwrap();
     runtime.poll_once().unwrap();
+    runtime.flush_meta_outputs().unwrap();
 
     let mut extra = Vec::new();
     assert_eq!(
@@ -1284,16 +1441,21 @@ fn runtime_udp_info_does_not_override_direct_meta_connection_like_tinc() {
         beta.udp_address.as_ref()
     );
 
-    let events = read_meta_events_until(&mut gamma_stream, &mut gamma_driver, |event| {
-        matches!(
-            event,
-            MetaConnectionEvent::Message(MetaMessage::UdpInfo(message))
-                if message.from == "beta"
-                    && message.to == "gamma"
-                    && message.endpoint.address == "198.51.100.7"
-                    && message.endpoint.port == "655"
-        )
-    });
+    let events = flush_then_read_meta_events_until(
+        &mut runtime,
+        &mut gamma_stream,
+        &mut gamma_driver,
+        |event| {
+            matches!(
+                event,
+                MetaConnectionEvent::Message(MetaMessage::UdpInfo(message))
+                    if message.from == "beta"
+                        && message.to == "gamma"
+                        && message.endpoint.address == "198.51.100.7"
+                        && message.endpoint.port == "655"
+            )
+        },
+    );
     assert!(events.iter().any(|event| matches!(
         event,
         MetaConnectionEvent::Message(MetaMessage::UdpInfo(message))
@@ -1359,16 +1521,21 @@ fn runtime_udp_info_does_not_override_confirmed_udp_address_like_tinc() {
     );
     assert!(beta.status.udp_confirmed);
 
-    let events = read_meta_events_until(&mut gamma_stream, &mut gamma_driver, |event| {
-        matches!(
-            event,
-            MetaConnectionEvent::Message(MetaMessage::UdpInfo(message))
-                if message.from == "beta"
-                    && message.to == "gamma"
-                    && message.endpoint.address == "198.51.100.7"
-                    && message.endpoint.port == "655"
-        )
-    });
+    let events = flush_then_read_meta_events_until(
+        &mut runtime,
+        &mut gamma_stream,
+        &mut gamma_driver,
+        |event| {
+            matches!(
+                event,
+                MetaConnectionEvent::Message(MetaMessage::UdpInfo(message))
+                    if message.from == "beta"
+                        && message.to == "gamma"
+                        && message.endpoint.address == "198.51.100.7"
+                        && message.endpoint.port == "655"
+            )
+        },
+    );
     assert!(events.iter().any(|event| matches!(
         event,
         MetaConnectionEvent::Message(MetaMessage::UdpInfo(message))
@@ -1421,12 +1588,14 @@ fn runtime_throttles_local_mtu_info_like_tinc() {
     runtime
         .send_mtu_info("alpha", "delta", DEFAULT_MTU)
         .unwrap();
+    runtime.flush_meta_outputs().unwrap();
     let first_written = runtime.meta_connections[0].bytes_written;
     assert!(first_written > 0);
 
     runtime
         .send_mtu_info("alpha", "delta", DEFAULT_MTU)
         .unwrap();
+    runtime.flush_meta_outputs().unwrap();
     assert_eq!(first_written, runtime.meta_connections[0].bytes_written);
 }
 

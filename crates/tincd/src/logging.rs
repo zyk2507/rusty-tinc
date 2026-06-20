@@ -310,7 +310,7 @@ impl OutgoingRetryState {
     pub(crate) fn mark_failed(&mut self, now: Instant, max_timeout_secs: u64) {
         self.timeout_secs =
             (self.timeout_secs + OUTGOING_CONNECT_RETRY_STEP_SECS).min(max_timeout_secs);
-        self.next_attempt = now + Duration::from_secs(self.timeout_secs);
+        self.next_attempt = now + tinc_timer_jitter(self.timeout_secs);
     }
 
     pub(crate) fn mark_connected(&mut self, now: Instant) {
@@ -359,13 +359,6 @@ pub(crate) fn record_outbound_traffic(
     counters.out_bytes = counters.out_bytes.saturating_add(bytes as u64);
 }
 
-pub(crate) fn push_control_pcap_packet(packets: &mut VecDeque<Vec<u8>>, data: &[u8]) {
-    if packets.len() >= CONTROL_PCAP_RING_CAPACITY {
-        packets.pop_front();
-    }
-    packets.push_back(data[..data.len().min(PCAP_CONTROL_BUFFER_SIZE)].to_vec());
-}
-
 pub(crate) fn publish_control_pcap_packet(
     subscribers: &mut Vec<RuntimeControlPcapSubscriber>,
     data: &[u8],
@@ -374,14 +367,10 @@ pub(crate) fn publish_control_pcap_packet(
         return;
     }
 
-    subscribers.retain(|subscriber| {
+    for subscriber in subscribers {
         let len = control_pcap_len(subscriber.snaplen, data.len());
-        let payload = data[..len].to_vec();
-        match subscriber.sender.try_send(payload) {
-            Ok(()) => true,
-            Err(mpsc::TrySendError::Full(_)) | Err(mpsc::TrySendError::Disconnected(_)) => false,
-        }
-    });
+        subscriber.writer.queue_payload(REQ_PCAP, &data[..len]);
+    }
 }
 
 pub(crate) fn control_pcap_len(snaplen: usize, len: usize) -> usize {
@@ -402,33 +391,6 @@ pub(crate) fn control_log_level(level: i32, debug_level: i32) -> i32 {
     }
 }
 
-pub(crate) fn spawn_control_payload_writer(
-    name: &str,
-    mut stream: Box<dyn Write + Send>,
-    request: i32,
-    receiver: mpsc::Receiver<Vec<u8>>,
-) -> Result<(), TincdError> {
-    thread::Builder::new()
-        .name(name.to_owned())
-        .spawn(move || {
-            let control = Request::Control.number();
-
-            for payload in receiver {
-                if writeln!(stream, "{control} {request} {}", payload.len()).is_err() {
-                    break;
-                }
-                if stream.write_all(&payload).is_err() {
-                    break;
-                }
-                if stream.flush().is_err() {
-                    break;
-                }
-            }
-        })
-        .map(|_| ())
-        .map_err(control_io)
-}
-
 pub(crate) fn secure_udp_session_missing(target: &str) -> TransportError {
     TransportError::Io(io::Error::new(
         io::ErrorKind::NetworkUnreachable,
@@ -445,12 +407,23 @@ pub(crate) fn key_expire_delay(key_expire: i32) -> Duration {
         return Duration::ZERO;
     }
 
-    let seconds = key_expire as u64;
+    tinc_timer_jitter(key_expire as u64)
+}
+
+pub(crate) fn tinc_timer_jitter(seconds: u64) -> Duration {
     Duration::from_secs(seconds) + Duration::from_micros(prng_below(TINC_TIMER_JITTER_US) as u64)
 }
 
+pub(crate) fn tinc_timer_jitter_duration(base: Duration) -> Duration {
+    base + Duration::from_micros(prng_below(TINC_TIMER_JITTER_US) as u64)
+}
+
 pub(crate) fn schedule_next_key_expire(now: Instant, key_expire: i32) -> Option<Instant> {
-    Some(now + key_expire_delay(key_expire))
+    if key_expire < 0 {
+        None
+    } else {
+        Some(now + key_expire_delay(key_expire))
+    }
 }
 
 pub(crate) fn current_unix_secs() -> i64 {

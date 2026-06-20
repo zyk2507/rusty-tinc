@@ -12,13 +12,13 @@ path = "src/main.rs"
 
 [dependencies]
 getrandom = "0.2"
+igd-next = "0.17.1"
 libc = "0.2"
+mio = { version = "1", features = ["os-ext"] }
 rsa = { version = "0.9", features = ["pem"] }
 sha2 = "0.10"
-roxmltree = "0.20"
 tinc-core = { path = "../tinc-core" }
 tinc-runtime = { path = "../tinc-runtime", default-features = false }
-url = "2"
 
 [features]
 default = ["lzo", "openssl-legacy"]

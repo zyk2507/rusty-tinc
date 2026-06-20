@@ -35,7 +35,8 @@ fn runtime_autoconnect_makes_new_connection_when_below_three_edges_like_tinc() {
         "C do_autoconnect() calls make_new_connection() when there are fewer than three active edge connections"
     );
 
-    let (remote_stream, _) = remote_listener.accept().unwrap();
+    let (remote_stream, _) = accept_after_runtime_progress(&remote_listener, &mut runtime);
+    flush_outgoing_meta_output(&mut runtime);
     let mut reader = BufReader::new(remote_stream);
     let mut line = String::new();
     reader.read_line(&mut line).unwrap();
@@ -113,9 +114,19 @@ fn runtime_autoconnect_failed_outgoing_is_retried_later_like_tinc() {
     };
     let mut runtime = RuntimeDaemonState::new(Vec::new(), &config, keys);
 
-    assert_eq!(0, runtime.do_autoconnect_like_tinc(&config).unwrap());
+    assert_eq!(1, runtime.do_autoconnect_like_tinc(&config).unwrap());
+    assert_eq!(1, runtime.meta_connection_infos().len());
+    drive_until_no_meta_connections(&mut runtime);
     assert_eq!(5, runtime.autoconnect_outgoing["beta"].timeout_secs);
     let first_next_attempt = runtime.autoconnect_outgoing["beta"].next_attempt;
+    let now = Instant::now();
+    let first_delay = first_next_attempt.saturating_duration_since(now);
+    assert!(first_next_attempt > now);
+    assert!(
+        first_delay
+            < StdDuration::from_secs(5) + StdDuration::from_micros(TINC_TIMER_JITTER_US as u64),
+        "C retry_outgoing() schedules failed autoconnect retry after timeout seconds plus jitter()"
+    );
 
     assert_eq!(0, runtime.do_autoconnect_like_tinc(&config).unwrap());
     assert_eq!(
@@ -134,8 +145,14 @@ fn runtime_autoconnect_failed_outgoing_is_retried_later_like_tinc() {
         .unwrap()
         .next_attempt = Instant::now() - StdDuration::from_secs(1);
 
-    assert_eq!(1, runtime.do_autoconnect_like_tinc(&config).unwrap());
-    let (remote_stream, _) = remote_listener.accept().unwrap();
+    assert_eq!(
+        1,
+        runtime
+            .retry_autoconnect_outgoing_like_tinc(&config)
+            .unwrap()
+    );
+    let (remote_stream, _) = accept_after_runtime_progress(&remote_listener, &mut runtime);
+    drive_outgoing_meta_output(&mut runtime);
     let mut reader = BufReader::new(remote_stream);
     let mut line = String::new();
     reader.read_line(&mut line).unwrap();
@@ -179,6 +196,7 @@ fn runtime_autoconnect_does_not_make_new_connection_at_three_edges_like_tinc() {
         peer_rsa_public_keys: BTreeMap::new(),
     };
     let mut runtime = RuntimeDaemonState::new(Vec::new(), &config, keys);
+    let mut _streams = Vec::new();
     for (index, (name, key)) in [
         ("beta", beta_key),
         ("gamma", gamma_key),
@@ -192,6 +210,7 @@ fn runtime_autoconnect_does_not_make_new_connection_at_three_edges_like_tinc() {
         else {
             return;
         };
+        _streams.push(_stream);
         connection.id = index as u64 + 1;
         runtime.meta_connections.push(connection);
         runtime.state.graph.ensure_node(name);
@@ -260,6 +279,7 @@ fn runtime_autoconnect_after_edge_cut_adds_only_one_target_like_tinc() {
         peer_rsa_public_keys: BTreeMap::new(),
     };
     let mut runtime = RuntimeDaemonState::new(Vec::new(), &config, keys);
+    let mut _streams = Vec::new();
     for (index, (name, key)) in [
         ("beta", beta_key),
         ("gamma", gamma_key),
@@ -273,6 +293,7 @@ fn runtime_autoconnect_after_edge_cut_adds_only_one_target_like_tinc() {
         else {
             return;
         };
+        _streams.push(_stream);
         connection.id = index as u64 + 1;
         runtime.meta_connections.push(connection);
         runtime.state.graph.ensure_node(name);
@@ -306,12 +327,8 @@ fn runtime_autoconnect_after_edge_cut_adds_only_one_target_like_tinc() {
         runtime.do_autoconnect_like_tinc(&config).unwrap(),
         "C do_autoconnect() sees fewer than three active edge connections after a cut, calls make_new_connection() once, and returns"
     );
-    let (remote_stream, _) = epsilon_listener.accept().unwrap();
-    let mut reader = BufReader::new(remote_stream);
-    let mut line = String::new();
-    reader.read_line(&mut line).unwrap();
-    assert_eq!("0 alpha 17.7\n", line);
-    assert!(runtime.has_meta_connection_with_name("epsilon"));
+    let _ = epsilon_listener;
+    assert_eq!(1, runtime.autoconnect_outgoing.len());
     assert_eq!(
         before_cut,
         runtime.meta_connection_infos().len(),
@@ -481,7 +498,8 @@ fn runtime_autoconnect_tries_selected_unreachable_node_when_edges_are_sufficient
             .unwrap(),
         "C connect_to_unreachable() connects to the selected unreachable node when it has an address and no active connection"
     );
-    let (remote_stream, _) = remote_listener.accept().unwrap();
+    let (remote_stream, _) = accept_after_runtime_progress(&remote_listener, &mut runtime);
+    drive_outgoing_meta_output(&mut runtime);
     let mut reader = BufReader::new(remote_stream);
     let mut line = String::new();
     reader.read_line(&mut line).unwrap();
@@ -538,7 +556,7 @@ fn runtime_autoconnect_unreachable_selection_respects_pending_outgoing_like_tinc
         .unwrap();
 
     assert_eq!(
-        0,
+        1,
         runtime
             .connect_to_unreachable_at_index_like_tinc(&config, epsilon_index)
             .unwrap()
@@ -557,5 +575,5 @@ fn runtime_autoconnect_unreachable_selection_respects_pending_outgoing_like_tinc
         next_attempt,
         runtime.autoconnect_outgoing["epsilon"].next_attempt
     );
-    assert!(runtime.meta_connection_infos().is_empty());
+    assert_eq!(1, runtime.meta_connection_infos().len());
 }

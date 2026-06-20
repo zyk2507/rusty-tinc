@@ -2,7 +2,7 @@
 
 pub(crate) use std::borrow::Borrow;
 pub(crate) use std::cell::Cell;
-pub(crate) use std::collections::{BTreeMap, VecDeque};
+pub(crate) use std::collections::{BTreeMap, BTreeSet, VecDeque};
 pub(crate) use std::env;
 #[cfg(unix)]
 pub(crate) use std::ffi::CString;
@@ -74,9 +74,8 @@ pub(crate) use tinc_runtime::sptps::{
 };
 pub(crate) use tinc_runtime::transport::{
     CompressionLevel, DEFAULT_REPLAY_WINDOW_BYTES, LEGACY_SEQNO_LEN, LegacyCipherAlgorithm,
-    LegacyDigest, LegacyPacketError, LegacyPeerState, LegacyUdpCodec, NodeAddressTable,
-    NodeIdTable, PacketCodec, RELAY_HEADER_LEN, RelayEnvelope, SPTPS_PACKET_TYPE_MAC,
-    SptpsPacketCodec, legacy_compression_is_available, sptps_packet_from_payload,
-    sptps_payload_from_packet,
+    LegacyDigest, LegacyPacketError, LegacyPeerState, LegacyUdpCodec, MAX_DATAGRAM_SIZE,
+    MAX_META_BUFFER_SIZE, NodeAddressTable, NodeIdTable, PacketCodec, RELAY_HEADER_LEN,
+    RelayEnvelope, SPTPS_PACKET_TYPE_MAC, SptpsPacketCodec, legacy_compression_is_available,
+    sptps_packet_from_payload, sptps_payload_from_packet,
 };
-pub(crate) use url::Url;

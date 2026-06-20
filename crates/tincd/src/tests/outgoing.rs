@@ -57,6 +57,7 @@ fn runtime_connects_configured_peers_and_sends_initial_id() {
     assert_eq!(1, runtime.connect_configured_peers(&config).unwrap());
 
     let (remote_stream, _) = remote_listener.accept().unwrap();
+    drive_outgoing_meta_output(&mut runtime);
     let mut reader = BufReader::new(remote_stream);
     let mut line = String::new();
     reader.read_line(&mut line).unwrap();
@@ -165,6 +166,7 @@ fn runtime_connects_configured_peer_through_http_proxy_like_tinc() {
     assert_eq!(1, runtime.connect_configured_peers(&config).unwrap());
 
     let (mut proxy_stream, _) = proxy_listener.accept().unwrap();
+    drive_outgoing_meta_output(&mut runtime);
     let mut reader = BufReader::new(proxy_stream.try_clone().unwrap());
     let mut line = String::new();
     reader.read_line(&mut line).unwrap();
@@ -257,6 +259,7 @@ fn runtime_connects_configured_peer_through_socks5_no_auth_proxy_like_tinc() {
     assert_eq!(1, runtime.connect_configured_peers(&config).unwrap());
 
     let (mut proxy_stream, _) = proxy_listener.accept().unwrap();
+    drive_outgoing_meta_output(&mut runtime);
     proxy_stream
         .set_read_timeout(Some(StdDuration::from_secs(1)))
         .unwrap();
@@ -347,6 +350,7 @@ fn runtime_connects_configured_peer_through_socks4_proxy_like_tinc() {
     assert_eq!(1, runtime.connect_configured_peers(&config).unwrap());
 
     let (mut proxy_stream, _) = proxy_listener.accept().unwrap();
+    drive_outgoing_meta_output(&mut runtime);
     proxy_stream
         .set_read_timeout(Some(StdDuration::from_secs(1)))
         .unwrap();
@@ -456,6 +460,7 @@ fn runtime_connects_configured_peer_through_socks5_password_proxy_like_tinc() {
     assert_eq!(1, runtime.connect_configured_peers(&config).unwrap());
 
     let (mut proxy_stream, _) = proxy_listener.accept().unwrap();
+    drive_outgoing_meta_output(&mut runtime);
     proxy_stream
         .set_read_timeout(Some(StdDuration::from_secs(1)))
         .unwrap();
@@ -642,7 +647,8 @@ fn runtime_connects_configured_peer_after_first_address_fails_like_tinc() {
 
     assert_eq!(1, runtime.connect_configured_peers(&config).unwrap());
 
-    let (remote_stream, _) = remote_listener.accept().unwrap();
+    let (remote_stream, _) = accept_after_runtime_progress(&remote_listener, &mut runtime);
+    drive_outgoing_meta_output(&mut runtime);
     let mut reader = BufReader::new(remote_stream);
     let mut line = String::new();
     reader.read_line(&mut line).unwrap();
@@ -709,6 +715,7 @@ fn runtime_outgoing_connection_prefers_disk_address_cache_like_tinc() {
     assert_eq!(1, runtime.connect_configured_peers(&config).unwrap());
 
     let (remote_stream, _) = cached_listener.accept().unwrap();
+    drive_outgoing_meta_output(&mut runtime);
     let mut reader = BufReader::new(remote_stream);
     let mut line = String::new();
     reader.read_line(&mut line).unwrap();
@@ -800,6 +807,14 @@ fn runtime_outgoing_address_cache_falls_back_to_second_recent_and_promotes_like_
 
     assert_eq!(1, alpha.connect_configured_peers(&alpha_config).unwrap());
 
+    for _ in 0..100 {
+        alpha.poll_once().unwrap();
+        if alpha.meta_connection_infos()[0].peer == second_recent_addr {
+            break;
+        }
+        thread::sleep(StdDuration::from_millis(10));
+    }
+
     assert_eq!(second_recent_addr, alpha.meta_connection_infos()[0].peer);
     assert_eq!(
         0, alpha.outgoing_retry["beta"].timeout_secs,
@@ -809,6 +824,8 @@ fn runtime_outgoing_address_cache_falls_back_to_second_recent_and_promotes_like_
     for _ in 0..100 {
         alpha.poll_once().unwrap();
         beta.poll_once().unwrap();
+        alpha.flush_meta_outputs().unwrap();
+        beta.flush_meta_outputs().unwrap();
         if alpha.state.graph.edge("alpha", "beta").is_some() {
             break;
         }
@@ -878,6 +895,7 @@ fn runtime_outgoing_connection_uses_reverse_edge_before_config_like_tinc() {
     assert!(runtime.connect_peer(&config, "beta").unwrap());
 
     let (remote_stream, _) = reverse_listener.accept().unwrap();
+    drive_outgoing_meta_output(&mut runtime);
     let mut reader = BufReader::new(remote_stream);
     let mut line = String::new();
     reader.read_line(&mut line).unwrap();
@@ -974,6 +992,8 @@ fn runtime_outgoing_ack_caches_remote_address_like_tinc() {
     for _ in 0..100 {
         alpha.poll_once().unwrap();
         beta.poll_once().unwrap();
+        alpha.flush_meta_outputs().unwrap();
+        beta.flush_meta_outputs().unwrap();
         if alpha.state.graph.edge("alpha", "beta").is_some() {
             break;
         }
@@ -1013,6 +1033,7 @@ fn runtime_pong_after_outgoing_retry_resets_address_cache_like_tinc() {
     let mut alpha = RuntimeDaemonState::new(Vec::new(), &config, keys);
     alpha.set_confbase(confbase.clone());
     beta_connection.id = 1;
+    beta_connection.outgoing_peer = Some("beta".to_owned());
     alpha.meta_connections.push(beta_connection);
     write_tinc_address_cache(&confbase.join("cache").join("beta"), &[old_addr]).unwrap();
     alpha.mark_outgoing_failed("beta", Instant::now());
@@ -1099,6 +1120,7 @@ fn runtime_binds_outgoing_connection_to_unique_bindtoaddress() {
 
     let (remote_stream, remote_peer) = remote_listener.accept().unwrap();
     assert_eq!(local_bind_ip, remote_peer.ip());
+    drive_outgoing_meta_output(&mut runtime);
     let mut reader = BufReader::new(remote_stream);
     let mut line = String::new();
     reader.read_line(&mut line).unwrap();
@@ -1167,8 +1189,17 @@ fn runtime_can_retry_configured_peer_after_initial_failure() {
     };
     let mut runtime = RuntimeDaemonState::new(sockets, &config, keys);
 
-    assert_eq!(0, runtime.connect_configured_peers(&config).unwrap());
+    assert_eq!(1, runtime.connect_configured_peers(&config).unwrap());
+    assert_eq!(1, runtime.meta_connection_infos().len());
+    for _ in 0..100 {
+        runtime.poll_once().unwrap();
+        if runtime.meta_connection_infos().is_empty() {
+            break;
+        }
+        thread::sleep(StdDuration::from_millis(10));
+    }
     assert!(runtime.meta_connection_infos().is_empty());
+    assert!(runtime.outgoing_retry["beta"].timeout_secs > 0);
 
     let remote_listener = match TcpListener::bind(remote_addr) {
         Ok(listener) => listener,
@@ -1179,8 +1210,11 @@ fn runtime_can_retry_configured_peer_after_initial_failure() {
         Err(error) => panic!("failed to bind retry listener: {error}"),
     };
 
-    assert_eq!(1, runtime.connect_configured_peers(&config).unwrap());
-    let (remote_stream, _) = remote_listener.accept().unwrap();
+    runtime.outgoing_retry.get_mut("beta").unwrap().next_attempt =
+        Instant::now() - StdDuration::from_secs(1);
+    assert_eq!(1, runtime.retry_configured_peers(&config).unwrap());
+    let (remote_stream, _) = accept_after_runtime_progress(&remote_listener, &mut runtime);
+    drive_outgoing_meta_output(&mut runtime);
     let mut reader = BufReader::new(remote_stream);
     let mut line = String::new();
     reader.read_line(&mut line).unwrap();

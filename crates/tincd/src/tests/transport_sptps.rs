@@ -51,6 +51,7 @@ fn runtime_drops_udp_datagrams_without_secure_state_like_tinc() {
         peer_rsa_public_keys: BTreeMap::new(),
     };
     let mut runtime = RuntimeDaemonState::new(sockets, &config, keys);
+    runtime.set_debug_level(DEBUG_TRAFFIC);
     runtime
         .state
         .graph
@@ -64,7 +65,7 @@ fn runtime_drops_udp_datagrams_without_secure_state_like_tinc() {
     runtime.poll_once().unwrap();
 
     assert!(runtime.device_writes().is_empty());
-    assert!(runtime.pcap_packets.is_empty());
+    assert!(runtime.pcap_subscribers.is_empty());
     assert_eq!(
         Some(&1),
         runtime.packet_diag_counts.get("udp-drop:no-key:beta")
@@ -79,7 +80,7 @@ fn runtime_drops_udp_datagrams_without_secure_state_like_tinc() {
 }
 
 #[test]
-fn runtime_unkeyed_sptps_udp_from_confirmed_peer_requests_key_like_tinc() {
+fn runtime_unkeyed_sptps_udp_from_identified_peer_requests_key_like_tinc() {
     tinc_test_support::assert_can_create_netns();
     let listen_socket = match test_runtime_listen_socket() {
         Ok(socket) => socket,
@@ -112,13 +113,13 @@ fn runtime_unkeyed_sptps_udp_from_confirmed_peer_requests_key_like_tinc() {
         return;
     };
     let mut runtime = RuntimeDaemonState::new(vec![listen_socket], &config, keys);
+    runtime.set_debug_level(DEBUG_TRAFFIC);
     beta_connection.id = 1;
     runtime.meta_connections.push(beta_connection);
     {
         let beta = runtime.state.graph.node_mut("beta").unwrap();
         beta.status.reachable = true;
         beta.status.sptps = true;
-        beta.status.udp_confirmed = true;
         beta.options = (PROT_MINOR as u32) << 24;
         beta.route.next_hop = Some("beta".to_owned());
         beta.route.via = Some("beta".to_owned());
@@ -141,9 +142,10 @@ fn runtime_unkeyed_sptps_udp_from_confirmed_peer_requests_key_like_tinc() {
             .unwrap()
             .status
             .waiting_for_key,
-        "C receive_udppacket() calls send_req_key() after a confirmed SPTPS peer sends UDP before keys exist"
+        "C receive_udppacket() calls send_req_key() after an identified SPTPS peer sends UDP before keys exist"
     );
     assert!(runtime.sptps_last_req_key.contains_key("beta"));
+    runtime.flush_meta_outputs().unwrap();
     let events = read_meta_events_until(&mut beta_stream, &mut beta_driver, |event| {
         is_sptps_initial_req_key(event, "alpha", "beta")
     });
@@ -151,7 +153,7 @@ fn runtime_unkeyed_sptps_udp_from_confirmed_peer_requests_key_like_tinc() {
         events
             .iter()
             .any(|event| is_sptps_initial_req_key(event, "alpha", "beta")),
-        "confirmed unkeyed SPTPS UDP should trigger C-style REQ_KEY"
+        "unkeyed SPTPS UDP from an identified peer should trigger C-style REQ_KEY"
     );
 
     let written_after_first = runtime.meta_connections[0].bytes_written;
@@ -233,6 +235,7 @@ fn runtime_relayed_unkeyed_sptps_udp_to_local_requests_origin_key_like_tinc() {
         return;
     };
     let mut runtime = RuntimeDaemonState::new(vec![listen_socket], &config, keys);
+    runtime.set_debug_level(DEBUG_TRAFFIC);
     beta_connection.id = 1;
     runtime.meta_connections.push(beta_connection);
     let options = (PROT_MINOR as u32) << 24;
@@ -279,6 +282,7 @@ fn runtime_relayed_unkeyed_sptps_udp_to_local_requests_origin_key_like_tinc() {
         "C receive_udppacket(from) triggers send_req_key(from) after a relayed-to-local SPTPS UDP packet without keys"
     );
     assert!(runtime.sptps_last_req_key.contains_key("beta"));
+    runtime.flush_meta_outputs().unwrap();
     let events = read_meta_events_until(&mut beta_stream, &mut beta_driver, |event| {
         is_sptps_initial_req_key(event, "alpha", "beta")
     });
@@ -1087,6 +1091,7 @@ fn runtime_sptps_relay_without_version_seven_uses_req_key_sptps_packet_like_tinc
         .push_device_packet(VpnPacket::new(packet.clone()).unwrap())
         .unwrap();
     alpha.poll_once().unwrap();
+    alpha.flush_meta_outputs().unwrap();
 
     let events = read_meta_events_until(&mut relay_stream, &mut relay_driver, |event| {
         matches!(
@@ -1243,6 +1248,7 @@ fn runtime_sptps_relay_tcponly_falls_back_to_sptps_tcp_not_plain_packet_like_tin
         .push_device_packet(VpnPacket::new(packet.clone()).unwrap())
         .unwrap();
     alpha.poll_once().unwrap();
+    alpha.flush_meta_outputs().unwrap();
 
     let events = read_meta_events_until(&mut relay_stream, &mut relay_driver, is_sptps_tcp_packet);
     assert!(
@@ -1337,6 +1343,11 @@ fn runtime_sptps_relay_over_min_mtu_falls_back_to_sptps_tcp_like_tinc() {
         rsa_private_key: None,
         peer_rsa_public_keys: BTreeMap::new(),
     };
+    let Some((mut stale_relay_stream, mut stale_relay_driver, mut stale_relay_connection)) =
+        active_runtime_connection("relay", alpha_key.clone(), relay_key.clone())
+    else {
+        return;
+    };
     let Some((mut relay_stream, mut relay_driver, mut relay_connection)) =
         active_runtime_connection("relay", alpha_key, relay_key)
     else {
@@ -1344,8 +1355,16 @@ fn runtime_sptps_relay_over_min_mtu_falls_back_to_sptps_tcp_like_tinc() {
     };
     let mut alpha = RuntimeDaemonState::new(vec![alpha_socket], &alpha_config, alpha_keys);
     let mut beta = RuntimeDaemonState::new(vec![beta_socket], &beta_config, beta_keys);
-    relay_connection.id = 1;
+    stale_relay_connection.id = 1;
+    stale_relay_connection.options = (PROT_MINOR as u32) << 24;
+    stale_relay_connection.close_requested = true;
+    stale_relay_connection.edge_peer = Some("relay".to_owned());
+    alpha.meta_connections.push(stale_relay_connection);
+
+    relay_connection.id = 2;
     relay_connection.options = (PROT_MINOR as u32) << 24;
+    relay_connection.edge_peer = Some("relay".to_owned());
+    alpha.local_edge_connections.insert("relay".to_owned(), 2);
     alpha.meta_connections.push(relay_connection);
 
     complete_sptps_udp_exchange(&mut alpha, &mut beta);
@@ -1373,6 +1392,19 @@ fn runtime_sptps_relay_over_min_mtu_falls_back_to_sptps_tcp_like_tinc() {
         .push_device_packet(VpnPacket::new(packet.clone()).unwrap())
         .unwrap();
     alpha.poll_once().unwrap();
+    alpha.flush_meta_outputs().unwrap();
+
+    let stale_events = read_meta_events_until(
+        &mut stale_relay_stream,
+        &mut stale_relay_driver,
+        is_sptps_tcp_packet,
+    );
+    assert!(
+        !stale_events
+            .iter()
+            .any(|event| matches!(event, MetaConnectionEvent::SptpsPacket(_))),
+        "SPTPS TCP fallback must skip a closing duplicate relay connection and use the current edge"
+    );
 
     let events = read_meta_events_until(&mut relay_stream, &mut relay_driver, is_sptps_tcp_packet);
     assert!(
@@ -1703,7 +1735,7 @@ fn runtime_forwards_sptps_udp_relay_datagram_without_decrypting_like_tinc() {
 }
 
 #[test]
-fn runtime_raw_sptps_tcp_packet_waits_for_destination_valid_key_like_tinc() {
+fn runtime_raw_sptps_tcp_packet_forwards_before_destination_valid_key_like_tinc() {
     tinc_test_support::assert_can_create_netns();
     let alpha_socket = match test_runtime_listen_socket() {
         Ok(socket) => socket,
@@ -1787,6 +1819,7 @@ fn runtime_raw_sptps_tcp_packet_waits_for_destination_valid_key_like_tinc() {
             },
         )
         .unwrap();
+    runtime.flush_meta_outputs().unwrap();
 
     let events = read_meta_events_until(&mut beta_stream, &mut beta_driver, |event| {
         is_sptps_initial_req_key(event, "alpha", "beta")
@@ -1795,7 +1828,7 @@ fn runtime_raw_sptps_tcp_packet_waits_for_destination_valid_key_like_tinc() {
         events
             .iter()
             .any(|event| is_sptps_initial_req_key(event, "alpha", "beta")),
-        "C receive_tcppacket_sptps() still calls try_tx(to, true) when destination validkey is false"
+        "C req_key_ext_h() calls try_tx(to, true) after forwarding SPTPS_PACKET data"
     );
     assert!(
         runtime.sptps_last_req_key.contains_key("beta"),
@@ -1812,19 +1845,14 @@ fn runtime_raw_sptps_tcp_packet_waits_for_destination_valid_key_like_tinc() {
     );
 
     let mut buffer = [0u8; 4096];
-    match beta_receiver.recv_from(&mut buffer) {
-        Err(error)
-            if matches!(
-                error.kind(),
-                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-            ) => {}
-        Ok((len, source)) => {
-            panic!(
-                "C receive_tcppacket_sptps() does not forward raw SPTPS TCP payload while destination validkey is false; got UDP len={len} from {source}"
-            )
-        }
-        Err(error) => panic!("failed checking beta UDP receiver: {error}"),
-    }
+    let (len, source) = beta_receiver
+        .recv_from(&mut buffer)
+        .expect("C req_key_ext_h() forwards SPTPS_PACKET data before destination validkey is set");
+    assert_eq!(runtime.listen_sockets[0].info().address, source);
+    let envelope = RelayEnvelope::decode(&buffer[..len]).unwrap();
+    assert_eq!(NodeId::from_name("beta"), envelope.destination);
+    assert_eq!(NodeId::from_name("gamma"), envelope.source);
+    assert_eq!(b"raw-sptps-record", envelope.payload.as_slice());
 }
 
 #[test]
@@ -1904,6 +1932,7 @@ fn runtime_raw_sptps_tcp_packet_to_local_sends_udp_info_before_decode_like_tinc(
             },
         )
         .unwrap();
+    runtime.flush_meta_outputs().unwrap();
 
     let events = read_meta_events_until(&mut beta_stream, &mut beta_driver, |event| {
         matches!(
@@ -2101,6 +2130,7 @@ fn runtime_relayed_sptps_udp_to_local_sends_mtu_info_without_updating_origin_add
         alpha_node.udp_address.as_ref(),
         "C handle_incoming_vpn_packet() only calls update_node_udp() for direct packets"
     );
+    beta.flush_meta_outputs().unwrap();
 
     let events = read_meta_events_until(&mut relay_stream, &mut relay_driver, |event| {
         matches!(
@@ -2122,6 +2152,174 @@ fn runtime_relayed_sptps_udp_to_local_sends_mtu_info_without_updating_origin_add
             )
         }),
         "C handle_incoming_vpn_packet() sends MTU_INFO to the actual UDP sender after relayed delivery"
+    );
+}
+
+#[test]
+fn runtime_relayed_sptps_udp_probe_to_local_does_not_update_origin_address_like_tinc() {
+    tinc_test_support::assert_can_create_netns();
+    let beta_socket = match test_runtime_listen_socket() {
+        Ok(socket) => socket,
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return,
+        Err(error) => panic!("failed to bind beta runtime listener: {error}"),
+    };
+    let relay_receiver = match UdpSocket::bind("127.0.0.1:0") {
+        Ok(socket) => socket,
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return,
+        Err(error) => panic!("failed to bind relay UDP receiver: {error}"),
+    };
+    relay_receiver.set_nonblocking(true).unwrap();
+    let sender_socket = match UdpSocket::bind("127.0.0.1:0") {
+        Ok(socket) => socket,
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return,
+        Err(error) => panic!("failed to bind sender UDP socket: {error}"),
+    };
+    sender_socket.set_nonblocking(true).unwrap();
+
+    let beta_addr = beta_socket.info().address;
+    let relay_addr = relay_receiver.local_addr().unwrap();
+    let sender_addr = sender_socket.local_addr().unwrap();
+    let alpha_key = test_key(1);
+    let beta_key = test_key(2);
+    let relay_key = test_key(3);
+    let alpha_public_key = alpha_key.public_key();
+    let beta_public_key = beta_key.public_key();
+    let relay_public_key = relay_key.public_key();
+    let options = (PROT_MINOR as u32) << 24;
+
+    let alpha_config = RuntimeConfig::from_config_tree(&config_tree(&[("Name", "alpha")])).unwrap();
+    let beta_server = config_tree(&[("Name", "beta"), ("AddressFamily", "IPv4")]);
+    let relay_address = format!("{} {}", relay_addr.ip(), relay_addr.port());
+    let sender_address = format!("{} {}", sender_addr.ip(), sender_addr.port());
+    let beta_config = RuntimeConfig::from_config_tree_with_hosts(
+        &beta_server,
+        [
+            ("alpha", &config_tree(&[])),
+            ("relay", &config_tree(&[("Address", &relay_address)])),
+            ("sender", &config_tree(&[("Address", &sender_address)])),
+        ],
+    )
+    .unwrap();
+
+    let mut alpha = RuntimeDaemonState::new(
+        Vec::new(),
+        &alpha_config,
+        RuntimeKeys {
+            private_key: Some(alpha_key),
+            peer_public_keys: BTreeMap::from([("beta".to_owned(), beta_public_key)]),
+            rsa_private_key: None,
+            peer_rsa_public_keys: BTreeMap::new(),
+        },
+    );
+    alpha.state.graph.ensure_node("beta");
+    {
+        let beta_node = alpha.state.graph.node_mut("beta").unwrap();
+        beta_node.status.reachable = true;
+        beta_node.status.sptps = true;
+        beta_node.options = options;
+        beta_node.route.next_hop = Some("beta".to_owned());
+        beta_node.route.via = Some("beta".to_owned());
+    }
+    *alpha.packet_codec.ids_mut() = NodeIdTable::from_network_state(&alpha.state);
+
+    let mut beta = RuntimeDaemonState::new(
+        vec![beta_socket],
+        &beta_config,
+        RuntimeKeys {
+            private_key: Some(beta_key),
+            peer_public_keys: BTreeMap::from([
+                ("alpha".to_owned(), alpha_public_key),
+                ("relay".to_owned(), relay_public_key),
+            ]),
+            rsa_private_key: None,
+            peer_rsa_public_keys: BTreeMap::new(),
+        },
+    );
+    beta.state.graph.ensure_node("alpha");
+    {
+        let alpha_node = beta.state.graph.node_mut("alpha").unwrap();
+        alpha_node.status.reachable = true;
+        alpha_node.status.sptps = true;
+        alpha_node.options = options;
+        alpha_node.route.next_hop = Some("relay".to_owned());
+        alpha_node.route.via = Some("relay".to_owned());
+        alpha_node.udp_address = Some(EdgeEndpoint::new("198.51.100.10", "655"));
+    }
+    beta.state.graph.ensure_node("relay");
+    {
+        let relay_node = beta.state.graph.node_mut("relay").unwrap();
+        relay_node.status.reachable = true;
+        relay_node.status.sptps = true;
+        relay_node.status.udp_confirmed = true;
+        relay_node.options = options;
+        relay_node.route.next_hop = Some("relay".to_owned());
+        relay_node.route.via = Some("relay".to_owned());
+        relay_node.udp_address = Some(EdgeEndpoint::new(
+            relay_addr.ip().to_string(),
+            relay_addr.port().to_string(),
+        ));
+    }
+    beta.state.graph.ensure_node("sender");
+    {
+        let sender_node = beta.state.graph.node_mut("sender").unwrap();
+        sender_node.status.reachable = true;
+        sender_node.status.sptps = true;
+        sender_node.status.udp_confirmed = true;
+        sender_node.options = options;
+        sender_node.route.next_hop = Some("sender".to_owned());
+        sender_node.route.via = Some("sender".to_owned());
+        sender_node.udp_address = Some(EdgeEndpoint::new(
+            sender_addr.ip().to_string(),
+            sender_addr.port().to_string(),
+        ));
+    }
+    *beta.packet_codec.ids_mut() = NodeIdTable::from_network_state(&beta.state);
+
+    complete_sptps_udp_exchange_between(&mut alpha, "beta", &mut beta, "alpha");
+
+    let probe = vec![0u8; UDP_PROBE_MIN_SIZE];
+    let datagram = alpha
+        .packet_codec
+        .encode_relayed_record("beta", SPTPS_UDP_PROBE_TYPE, &probe)
+        .unwrap();
+    sender_socket.send_to(&datagram, beta_addr).unwrap();
+    beta.poll_once().unwrap();
+
+    assert_eq!(
+        Some(&EdgeEndpoint::new("198.51.100.10", "655")),
+        beta.state.graph.node("alpha").unwrap().udp_address.as_ref(),
+        "C handle_incoming_vpn_packet() only calls update_node_udp() for direct SPTPS probes"
+    );
+
+    let mut buffer = [0u8; 2048];
+    let deadline = Instant::now() + StdDuration::from_secs(1);
+    let (len, reply_source) = loop {
+        match relay_receiver.recv_from(&mut buffer) {
+            Ok(received) => break received,
+            Err(error)
+                if error.kind() == io::ErrorKind::WouldBlock && Instant::now() < deadline =>
+            {
+                thread::sleep(StdDuration::from_millis(10));
+            }
+            Err(error) => panic!("failed to receive relayed probe reply: {error}"),
+        }
+    };
+    assert_eq!(beta_addr, reply_source);
+    let record = alpha
+        .packet_codec
+        .decode_record("beta", &buffer[..len])
+        .unwrap();
+    assert_eq!(SPTPS_UDP_PROBE_TYPE, record.record_type);
+    assert_eq!(2, record.payload[0]);
+
+    match sender_socket.recv_from(&mut buffer) {
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+        Ok((len, source)) => panic!("unexpected direct probe reply from {source}: len={len}"),
+        Err(error) => panic!("failed checking sender UDP socket: {error}"),
+    }
+    assert_ne!(
+        sender_addr, relay_addr,
+        "test must use separate relay and sender UDP sockets"
     );
 }
 
@@ -2234,26 +2432,28 @@ fn runtime_sptps_udp_relay_sends_udp_info_only_for_dynamic_relay_like_tinc() {
     envelope.destination = NodeId::from_name("beta");
     datagram = envelope.encode();
 
-    let first_written = relay.meta_connections[0].bytes_written;
+    let first_pending = relay.meta_connections[0].pending_output_len();
     let relay_addr = relay.listen_sockets[0].info().address;
     relay
         .handle_sptps_udp_envelope("alpha", relay_addr, 0, &datagram)
         .unwrap();
-    let after_static_relay = relay.meta_connections[0].bytes_written;
+    let after_static_relay = relay.meta_connections[0].pending_output_len();
     assert_eq!(
-        first_written, after_static_relay,
+        first_pending, after_static_relay,
         "C handle_incoming_vpn_packet() does not send UDP_INFO when the UDP sender is from->via"
     );
 
     relay
         .handle_sptps_udp_envelope("gamma", relay_addr, 0, &datagram)
         .unwrap();
+    let after_dynamic_relay = relay.meta_connections[0].pending_output_len();
     assert!(
-        relay.meta_connections[0].bytes_written > after_static_relay,
+        after_dynamic_relay > after_static_relay,
         "C handle_incoming_vpn_packet() sends UDP_INFO only when n != from->via and to->via == myself"
     );
 
     let udp_info_endpoint = relay.meta_connections[0].local;
+    relay.flush_meta_outputs().unwrap();
     let events = read_meta_events_until(&mut gamma_stream, &mut gamma_driver, |event| {
         matches!(
             event,
@@ -2286,6 +2486,7 @@ fn runtime_sptps_udp_relay_sends_udp_info_only_for_dynamic_relay_like_tinc() {
     relay
         .handle_sptps_udp_envelope("gamma", relay_addr, 0, &local_datagram)
         .unwrap();
+    relay.flush_meta_outputs().unwrap();
 
     let local_events = read_meta_events_until(&mut gamma_stream, &mut gamma_driver, |event| {
         matches!(

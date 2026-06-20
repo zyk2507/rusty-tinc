@@ -2023,13 +2023,6 @@ fn accept_invitation(
     let stream = TcpStream::connect(&address).map_err(|error| {
         TincError::InvitationFailed(format!("could not connect to inviter {address}: {error}"))
     })?;
-    stream
-        .set_read_timeout(Some(INVITATION_TIMEOUT))
-        .map_err(|error| invitation_io_error(&address, error))?;
-    stream
-        .set_write_timeout(Some(INVITATION_TIMEOUT))
-        .map_err(|error| invitation_io_error(&address, error))?;
-
     let mut connection = InvitationConnection::new(stream);
     let throwaway_key = generate_ed25519_keypair()?;
     let throwaway_public = throwaway_key.public_key().to_base64();
@@ -2058,7 +2051,9 @@ fn accept_invitation(
     let trailing = connection.take_buffer();
 
     if !trailing.is_empty() {
-        decoder.push(&trailing);
+        decoder
+            .push(&trailing)
+            .map_err(|error| TincError::InvitationFailed(error.to_string()))?;
     }
 
     loop {
@@ -2125,7 +2120,7 @@ fn accept_invitation(
             }
         }
 
-        let read = connection.read_more()?;
+        let read = connection.read_more_with_timeout(INVITATION_TIMEOUT)?;
 
         if read == 0 {
             return Err(TincError::InvitationFailed(
@@ -2134,7 +2129,9 @@ fn accept_invitation(
         }
 
         let chunk = connection.take_buffer();
-        decoder.push(&chunk);
+        decoder
+            .push(&chunk)
+            .map_err(|error| TincError::InvitationFailed(error.to_string()))?;
     }
 }
 
@@ -2192,14 +2189,12 @@ fn invitation_socket_address(address: &str, port: &str) -> Result<String, TincEr
     }
 }
 
-fn invitation_io_error(address: &str, error: io::Error) -> TincError {
-    TincError::InvitationFailed(format!(
-        "invitation connection to {address} failed: {error}"
-    ))
-}
-
 fn invitation_sptps_error(error: impl fmt::Display) -> TincError {
     TincError::InvitationFailed(format!("invitation SPTPS failed: {error}"))
+}
+
+fn invitation_read_error(error: io::Error) -> TincError {
+    TincError::InvitationFailed(format!("invitation read failed: {error}"))
 }
 
 struct InvitationConnection {
@@ -2240,10 +2235,42 @@ impl InvitationConnection {
     }
 
     fn read_more(&mut self) -> Result<usize, TincError> {
-        let mut chunk = [0u8; 4096];
-        let len = self.stream.read(&mut chunk).map_err(|error| {
-            TincError::InvitationFailed(format!("invitation read failed: {error}"))
+        self.read_more_io().map_err(invitation_read_error)
+    }
+
+    fn read_more_with_timeout(&mut self, timeout: Duration) -> Result<usize, TincError> {
+        self.stream
+            .set_read_timeout(Some(timeout))
+            .map_err(|error| {
+                TincError::InvitationFailed(format!(
+                    "could not configure invitation socket timeout: {error}"
+                ))
+            })?;
+        let result = match self.read_more_io() {
+            Ok(len) => Ok(len),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                Err(TincError::InvitationFailed(
+                    "timed out waiting for the server to reply".to_owned(),
+                ))
+            }
+            Err(error) => Err(invitation_read_error(error)),
+        };
+        self.stream.set_read_timeout(None).map_err(|error| {
+            TincError::InvitationFailed(format!(
+                "could not clear invitation socket timeout: {error}"
+            ))
         })?;
+        result
+    }
+
+    fn read_more_io(&mut self) -> io::Result<usize> {
+        let mut chunk = [0u8; 4096];
+        let len = self.stream.read(&mut chunk)?;
         self.buffer.extend_from_slice(&chunk[..len]);
         Ok(len)
     }
@@ -9024,7 +9051,7 @@ Ed25519PublicKey = {server_public}\n"
                 panic!("client closed invitation connection");
             }
 
-            decoder.push(&connection.take_buffer());
+            decoder.push(&connection.take_buffer()).unwrap();
         }
     }
 

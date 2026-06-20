@@ -14,8 +14,12 @@ use crate::sptps::{
     SPTPS_TCP_AUTH_OVERHEAD, SPTPS_TCP_HEADER_LEN, SptpsError, SptpsHandshakeEvent,
     SptpsHandshakeSession, TincEd25519PrivateKey, TincEd25519PublicKey,
 };
+use crate::transport::MAX_META_BUFFER_SIZE;
 
 pub const SPTPS_META_RECORD: u8 = 0;
+// C sptps_receive_data() keeps a separate buffer for one TCP SPTPS record and
+// reallocates it to reclen + 19 bytes after reading the u16 record length.
+const MAX_SPTPS_TCP_RECORD_BUFFER_SIZE: usize = u16::MAX as usize + SPTPS_TCP_AUTH_OVERHEAD;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MetaConnectionAuth {
@@ -296,8 +300,20 @@ impl MetaStreamDecoder {
         self.pending_body
     }
 
-    pub fn push(&mut self, data: &[u8]) {
+    pub fn push(&mut self, data: &[u8]) -> Result<(), MetaStreamError> {
+        self.push_limited(data, MAX_META_BUFFER_SIZE)
+    }
+
+    fn push_limited(&mut self, data: &[u8], maximum: usize) -> Result<(), MetaStreamError> {
+        let next_len = self.buffer.len().saturating_add(data.len());
+        if next_len > maximum {
+            return Err(MetaStreamError::InputBufferFull {
+                maximum,
+                actual: next_len,
+            });
+        }
         self.buffer.extend_from_slice(data);
+        Ok(())
     }
 
     pub fn observe_meta_message(&mut self, message: &MetaMessage) {
@@ -336,21 +352,9 @@ impl MetaStreamDecoder {
             return Ok(Some(body));
         }
 
-        if self.buffer.len() < 2 {
+        let Some(expected) = self.expected_sptps_frame_len(encrypted) else {
             return Ok(None);
-        }
-
-        let length = u16::from_be_bytes(
-            self.buffer[..2]
-                .try_into()
-                .expect("SPTPS TCP length bytes checked"),
-        ) as usize;
-        let expected = length
-            + if encrypted {
-                SPTPS_TCP_AUTH_OVERHEAD
-            } else {
-                SPTPS_TCP_HEADER_LEN
-            };
+        };
 
         if self.buffer.len() < expected {
             return Ok(None);
@@ -359,6 +363,26 @@ impl MetaStreamDecoder {
         Ok(Some(MetaStreamFrame::SptpsRecord(
             self.buffer.drain(..expected).collect(),
         )))
+    }
+
+    fn expected_sptps_frame_len(&self, encrypted: bool) -> Option<usize> {
+        if self.buffer.len() < 2 {
+            return None;
+        }
+
+        let length = u16::from_be_bytes(
+            self.buffer[..2]
+                .try_into()
+                .expect("SPTPS TCP length bytes checked"),
+        ) as usize;
+        Some(
+            length
+                + if encrypted {
+                    SPTPS_TCP_AUTH_OVERHEAD
+                } else {
+                    SPTPS_TCP_HEADER_LEN
+                },
+        )
     }
 
     fn next_body_frame(&mut self) -> Option<MetaStreamFrame> {
@@ -398,12 +422,19 @@ pub enum MetaStreamFrame {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MetaStreamError {
     InvalidUtf8,
+    InputBufferFull { maximum: usize, actual: usize },
 }
 
 impl fmt::Display for MetaStreamError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidUtf8 => write!(f, "meta stream line is not valid UTF-8"),
+            Self::InputBufferFull { maximum, actual } => {
+                write!(
+                    f,
+                    "meta input buffer full: {actual} bytes, maximum is {maximum}"
+                )
+            }
         }
     }
 }
@@ -450,23 +481,23 @@ impl MetaConnectionDriver {
         &mut self,
         data: &[u8],
     ) -> Result<MetaConnectionStep, MetaConnectionError> {
-        self.decoder.push(data);
         let mut step = MetaConnectionStep::default();
+        let mut remaining = data;
 
-        loop {
-            let frame = match self.auth.state() {
-                MetaAuthState::ExpectId => self.decoder.next_plaintext_frame()?,
-                _ if self.auth.uses_plaintext_meta() => self.decoder.next_plaintext_frame()?,
-                _ => self
-                    .decoder
-                    .next_sptps_frame(self.auth.sptps_in_encrypted())?,
-            };
-
-            let Some(frame) = frame else {
-                break;
-            };
-
-            self.handle_frame(frame, &mut step)?;
+        self.drain_available_frames(&mut step)?;
+        while !remaining.is_empty() {
+            let (limit, available) = self.next_input_window()?;
+            if available == 0 {
+                return Err(MetaStreamError::InputBufferFull {
+                    maximum: limit,
+                    actual: self.decoder.buffered_len().saturating_add(remaining.len()),
+                }
+                .into());
+            }
+            let take = remaining.len().min(available);
+            self.decoder.push_limited(&remaining[..take], limit)?;
+            remaining = &remaining[take..];
+            self.drain_available_frames(&mut step)?;
         }
 
         Ok(step)
@@ -518,6 +549,68 @@ impl MetaConnectionDriver {
         } else {
             Err(MetaConnectionError::NotActivated(self.auth.state()))
         }
+    }
+
+    fn drain_available_frames(
+        &mut self,
+        step: &mut MetaConnectionStep,
+    ) -> Result<(), MetaConnectionError> {
+        loop {
+            let frame = match self.auth.state() {
+                MetaAuthState::ExpectId => self.decoder.next_plaintext_frame()?,
+                _ if self.auth.uses_plaintext_meta() => self.decoder.next_plaintext_frame()?,
+                _ => self
+                    .decoder
+                    .next_sptps_frame(self.auth.sptps_in_encrypted())?,
+            };
+
+            let Some(frame) = frame else {
+                break;
+            };
+
+            self.handle_frame(frame, step)?;
+        }
+
+        Ok(())
+    }
+
+    fn next_input_window(&self) -> Result<(usize, usize), MetaConnectionError> {
+        if let Some(body) = self.decoder.pending_body() {
+            if body.length > MAX_META_BUFFER_SIZE {
+                return Err(MetaStreamError::InputBufferFull {
+                    maximum: MAX_META_BUFFER_SIZE,
+                    actual: body.length,
+                }
+                .into());
+            }
+            return Ok((
+                MAX_META_BUFFER_SIZE,
+                body.length.saturating_sub(self.decoder.buffered_len()),
+            ));
+        }
+
+        if matches!(self.auth.state(), MetaAuthState::ExpectId) || self.auth.uses_plaintext_meta() {
+            return Ok((
+                MAX_META_BUFFER_SIZE,
+                MAX_META_BUFFER_SIZE.saturating_sub(self.decoder.buffered_len()),
+            ));
+        }
+
+        if self.decoder.buffered_len() < 2 {
+            return Ok((
+                MAX_SPTPS_TCP_RECORD_BUFFER_SIZE,
+                2 - self.decoder.buffered_len(),
+            ));
+        }
+
+        let expected = self
+            .decoder
+            .expected_sptps_frame_len(self.auth.sptps_in_encrypted())
+            .expect("SPTPS TCP length bytes checked");
+        Ok((
+            MAX_SPTPS_TCP_RECORD_BUFFER_SIZE,
+            expected.saturating_sub(self.decoder.buffered_len()),
+        ))
     }
 
     fn handle_frame(
@@ -965,6 +1058,7 @@ mod tests {
     use tinc_core::graph::{EdgeEndpoint, OPTION_CLAMP_MSS};
     use tinc_core::protocol::{IdMessage, PROT_MINOR, parse_meta_message};
 
+    use crate::device::MTU;
     use crate::sptps::{
         ED25519_SEED_LEN, SPTPS_HANDSHAKE, SPTPS_TAG_LEN, SptpsKey, SptpsTcpCodec,
         TincEd25519PrivateKey,
@@ -1154,9 +1248,9 @@ mod tests {
         tinc_test_support::assert_can_create_netns();
         let mut decoder = MetaStreamDecoder::new();
 
-        decoder.push(b"8\r");
+        decoder.push(b"8\r").unwrap();
         assert_eq!(None, decoder.next_plaintext_frame().unwrap());
-        decoder.push(b"\n17 4\nabcd9\n");
+        decoder.push(b"\n17 4\nabcd9\n").unwrap();
 
         assert_eq!(
             Some(MetaStreamFrame::Line("8".to_owned())),
@@ -1191,9 +1285,9 @@ mod tests {
         let plain_record = plain_codec.encode(SPTPS_HANDSHAKE, b"kex").unwrap();
         let mut decoder = MetaStreamDecoder::new();
 
-        decoder.push(&plain_record[..2]);
+        decoder.push(&plain_record[..2]).unwrap();
         assert_eq!(None, decoder.next_sptps_frame(false).unwrap());
-        decoder.push(&plain_record[2..]);
+        decoder.push(&plain_record[2..]).unwrap();
         assert_eq!(
             Some(MetaStreamFrame::SptpsRecord(plain_record)),
             decoder.next_sptps_frame(false).unwrap()
@@ -1203,9 +1297,13 @@ mod tests {
         let mut encrypted_codec = SptpsTcpCodec::with_keys(key.clone(), key);
         let encrypted_record = encrypted_codec.encode(0, b"8\n").unwrap();
         assert_eq!(2 + 1 + 2 + SPTPS_TAG_LEN, encrypted_record.len());
-        decoder.push(&encrypted_record[..encrypted_record.len() - 1]);
+        decoder
+            .push(&encrypted_record[..encrypted_record.len() - 1])
+            .unwrap();
         assert_eq!(None, decoder.next_sptps_frame(true).unwrap());
-        decoder.push(&encrypted_record[encrypted_record.len() - 1..]);
+        decoder
+            .push(&encrypted_record[encrypted_record.len() - 1..])
+            .unwrap();
         assert_eq!(
             Some(MetaStreamFrame::SptpsRecord(encrypted_record)),
             decoder.next_sptps_frame(true).unwrap()
@@ -1220,8 +1318,8 @@ mod tests {
         let mut decoder = MetaStreamDecoder::new();
 
         decoder.expect_body(MetaBodyKind::SptpsPacket, 3);
-        decoder.push(b"abc");
-        decoder.push(&record);
+        decoder.push(b"abc").unwrap();
+        decoder.push(&record).unwrap();
 
         assert_eq!(
             Some(MetaStreamFrame::Body {
@@ -1322,6 +1420,36 @@ mod tests {
                 MetaConnectionEvent::SptpsPacket(b"raw".to_vec()),
             ],
             sptps_step.events
+        );
+    }
+
+    #[test]
+    fn meta_connection_driver_drains_frames_while_receiving_like_tinc() {
+        tinc_test_support::assert_can_create_netns();
+        let (mut alice, mut bob) = established_driver_pair();
+        let packet = vec![0x5a; MTU];
+        let mut combined = Vec::new();
+
+        combined.extend(flatten_outbound(alice.send_sptps_packet(&packet).unwrap()));
+        combined.extend(flatten_outbound(alice.send_sptps_packet(&packet).unwrap()));
+        assert!(
+            combined.len() > MAX_META_BUFFER_SIZE,
+            "test input must exceed one tinc MAXBUFSIZE-sized read buffer"
+        );
+
+        let step = bob.receive_bytes(&combined).unwrap();
+        assert_eq!(
+            vec![
+                MetaConnectionEvent::Message(MetaMessage::SptpsTcpPacket(TcpPacketMessage {
+                    length: MTU as u16
+                })),
+                MetaConnectionEvent::SptpsPacket(packet.clone()),
+                MetaConnectionEvent::Message(MetaMessage::SptpsTcpPacket(TcpPacketMessage {
+                    length: MTU as u16
+                })),
+                MetaConnectionEvent::SptpsPacket(packet),
+            ],
+            step.events
         );
     }
 

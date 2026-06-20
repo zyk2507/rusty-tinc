@@ -4,6 +4,8 @@ pub(crate) const CONNECTION_STATUS_PENDING: u32 = 0;
 pub(crate) const CONNECTION_STATUS_ACTIVE: u32 = 1;
 pub(crate) const CONNECTION_DUMP_STATUS_PINGED: u32 = 1 << 0;
 pub(crate) const CONNECTION_DUMP_STATUS_CONTROL: u32 = 1 << 9;
+pub(crate) const CONNECTION_DUMP_STATUS_PCAP: u32 = 1 << 10;
+pub(crate) const CONNECTION_DUMP_STATUS_LOG: u32 = 1 << 11;
 pub(crate) const CONNECTION_DUMP_STATUS_INVITATION: u32 = 1 << 13;
 pub(crate) const CONNECTION_DUMP_STATUS_INVITATION_USED: u32 = 1 << 14;
 
@@ -19,10 +21,14 @@ pub(crate) struct RuntimeMetaConnection {
     pub(crate) outbound_offset: usize,
     pub(crate) status: u32,
     pub(crate) options: u32,
+    pub(crate) outgoing_peer: Option<String>,
     pub(crate) outgoing_autoconnect: bool,
+    pub(crate) connecting: bool,
     pub(crate) close_requested: bool,
     pub(crate) last_activity: Instant,
+    pub(crate) last_ping_time: Instant,
     pub(crate) last_ping_sent: Option<Instant>,
+    pub(crate) edge_peer: Option<String>,
     pub(crate) exec_proxy: Option<RuntimeExecProxyChild>,
     pub(crate) kind: RuntimeMetaConnectionKind,
 }
@@ -234,6 +240,22 @@ impl RuntimeMetaConnection {
         Some(name)
     }
 
+    pub(crate) fn authenticated_name(&self) -> Option<&str> {
+        if self.is_active_authenticated() {
+            self.active_name()
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn can_carry_data_for_peer(&self, peer: &str) -> bool {
+        !self.close_requested && self.authenticated_name() == Some(peer)
+    }
+
+    pub(crate) fn is_current_edge_connection_for_peer(&self, peer: &str) -> bool {
+        self.can_carry_data_for_peer(peer) && self.edge_peer.as_deref() == Some(peer)
+    }
+
     pub(crate) fn is_outgoing(&self) -> bool {
         match &self.kind {
             RuntimeMetaConnectionKind::Active { driver, .. } => driver.is_outgoing(),
@@ -241,13 +263,25 @@ impl RuntimeMetaConnection {
         }
     }
 
+    pub(crate) fn has_pending_output(&self) -> bool {
+        self.connecting || self.outbound_offset < self.outbound.len()
+    }
+
     pub(crate) fn write_meta_chunk(&mut self, chunk: &[u8]) -> io::Result<()> {
         self.compact_outbound();
         self.outbound.extend_from_slice(chunk);
-        self.flush_meta_output()
+        Ok(())
     }
 
     pub(crate) fn flush_meta_output(&mut self) -> io::Result<()> {
+        if self.connecting {
+            match finish_outgoing_connect_like_tinc(&self.stream) {
+                Ok(true) => self.connecting = false,
+                Ok(false) => return Ok(()),
+                Err(error) => return Err(error),
+            }
+        }
+
         while self.pending_output_len() > 0 {
             match self.stream.write(&self.outbound[self.outbound_offset..]) {
                 Ok(0) => return Ok(()),
@@ -265,6 +299,37 @@ impl RuntimeMetaConnection {
         }
 
         Ok(())
+    }
+
+    pub(crate) fn flush_meta_output_once(&mut self) -> io::Result<RuntimeIoProgress> {
+        if self.connecting {
+            match finish_outgoing_connect_like_tinc(&self.stream) {
+                Ok(true) => self.connecting = false,
+                Ok(false) => return Ok(RuntimeIoProgress::NotReady),
+                Err(error) => return Err(error),
+            }
+        }
+
+        if self.pending_output_len() == 0 {
+            return Ok(RuntimeIoProgress::NotReady);
+        }
+
+        match self.stream.write(&self.outbound[self.outbound_offset..]) {
+            Ok(0) => Ok(RuntimeIoProgress::NotReady),
+            Ok(len) => {
+                self.bytes_written += len as u64;
+                self.outbound_offset += len;
+                if self.pending_output_len() == 0 {
+                    self.outbound.clear();
+                    self.outbound_offset = 0;
+                }
+                Ok(RuntimeIoProgress::Processed)
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                Ok(RuntimeIoProgress::NotReady)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     pub(crate) fn pending_output_len(&self) -> usize {
@@ -286,6 +351,82 @@ impl RuntimeMetaConnection {
         }
         self.outbound_offset = 0;
     }
+}
+
+pub(crate) fn queue_meta_chunk(connection: &mut RuntimeMetaConnection, chunk: &[u8]) {
+    connection.compact_outbound();
+    connection.outbound.extend_from_slice(chunk);
+}
+
+#[cfg(unix)]
+pub(crate) fn finish_outgoing_connect_like_tinc(stream: &TcpStream) -> io::Result<bool> {
+    let result = unsafe { libc::send(stream.as_raw_fd(), std::ptr::null(), 0, 0) };
+    if result == 0 {
+        return Ok(true);
+    }
+    if result > 0 {
+        return Ok(true);
+    }
+
+    let error = io::Error::last_os_error();
+    if connect_probe_in_progress(&error) {
+        return Ok(false);
+    }
+    if !connect_probe_not_connected(&error) {
+        return Err(error);
+    }
+
+    match socket_error(stream.as_raw_fd())? {
+        Some(error) if connect_probe_in_progress(&error) => Ok(false),
+        Some(error) => Err(error),
+        None => Ok(false),
+    }
+}
+
+#[cfg(unix)]
+fn connect_probe_in_progress(error: &io::Error) -> bool {
+    if matches!(
+        error.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+    ) {
+        return true;
+    }
+    matches!(
+        error.raw_os_error(),
+        Some(code) if code == libc::EINPROGRESS || code == libc::EALREADY
+    )
+}
+
+#[cfg(unix)]
+fn connect_probe_not_connected(error: &io::Error) -> bool {
+    error.raw_os_error() == Some(libc::ENOTCONN)
+}
+
+#[cfg(unix)]
+fn socket_error(fd: RawFd) -> io::Result<Option<io::Error>> {
+    let mut value: libc::c_int = 0;
+    let mut length = std::mem::size_of_val(&value) as libc::socklen_t;
+    let result = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_ERROR,
+            (&mut value as *mut libc::c_int).cast(),
+            &mut length,
+        )
+    };
+    if result < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if value == 0 {
+        return Ok(None);
+    }
+    Ok(Some(io::Error::from_raw_os_error(value)))
+}
+
+#[cfg(not(unix))]
+pub(crate) fn finish_outgoing_connect_like_tinc(_stream: &TcpStream) -> io::Result<bool> {
+    Ok(true)
 }
 
 pub(crate) fn send_plain_tcp_packet_on_connection(

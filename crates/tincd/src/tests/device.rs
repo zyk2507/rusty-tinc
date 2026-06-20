@@ -548,6 +548,7 @@ fn runtime_does_not_send_device_packets_over_udp_without_secure_state_like_tinc(
         peer_rsa_public_keys: BTreeMap::new(),
     };
     let mut runtime = RuntimeDaemonState::new(sockets, &config, keys);
+    runtime.set_debug_level(DEBUG_TRAFFIC);
     runtime
         .state
         .apply_meta_message(parse_meta_message("10 1 beta 10.2.0.0/16").unwrap())
@@ -752,6 +753,7 @@ fn runtime_sends_device_packets_over_meta_tcp_when_tcponly_like_tinc() {
         .push_device_packet(VpnPacket::new(packet.clone()).unwrap())
         .unwrap();
     runtime.poll_once().unwrap();
+    runtime.flush_meta_outputs().unwrap();
 
     let mut buffer = [0u8; 2048];
     let len = beta_stream.read(&mut buffer).unwrap();

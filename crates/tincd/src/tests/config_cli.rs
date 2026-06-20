@@ -317,19 +317,32 @@ fn runtime_outgoing_retry_backoff_uses_max_timeout_like_tinc() {
     };
     let mut runtime = RuntimeDaemonState::new(Vec::new(), &config, keys);
 
-    assert_eq!(0, runtime.retry_configured_peers(&config).unwrap());
+    assert_eq!(1, runtime.retry_configured_peers(&config).unwrap());
+    assert_eq!(1, runtime.meta_connection_infos().len());
+    drive_until_no_meta_connections(&mut runtime);
     let retry = runtime.outgoing_retry.get("beta").unwrap();
     assert_eq!(5, retry.timeout_secs);
-    assert!(retry.next_attempt > Instant::now());
+    let now = Instant::now();
+    let retry_delay = retry.next_attempt.saturating_duration_since(now);
+    assert!(retry.next_attempt > now);
+    assert!(
+        retry_delay
+            < StdDuration::from_secs(5) + StdDuration::from_micros(TINC_TIMER_JITTER_US as u64),
+        "C retry_outgoing() schedules timeout seconds plus jitter() microseconds"
+    );
 
     runtime.outgoing_retry.get_mut("beta").unwrap().next_attempt =
         Instant::now() - StdDuration::from_secs(1);
-    assert_eq!(0, runtime.retry_configured_peers(&config).unwrap());
+    assert_eq!(1, runtime.retry_configured_peers(&config).unwrap());
+    assert_eq!(1, runtime.meta_connection_infos().len());
+    drive_until_no_meta_connections(&mut runtime);
     assert_eq!(8, runtime.outgoing_retry.get("beta").unwrap().timeout_secs);
 
     runtime.outgoing_retry.get_mut("beta").unwrap().next_attempt =
         Instant::now() - StdDuration::from_secs(1);
-    assert_eq!(0, runtime.retry_configured_peers(&config).unwrap());
+    assert_eq!(1, runtime.retry_configured_peers(&config).unwrap());
+    assert_eq!(1, runtime.meta_connection_infos().len());
+    drive_until_no_meta_connections(&mut runtime);
     assert_eq!(8, runtime.outgoing_retry.get("beta").unwrap().timeout_secs);
 
     let remote_listener = match TcpListener::bind(remote_addr) {
@@ -341,7 +354,8 @@ fn runtime_outgoing_retry_backoff_uses_max_timeout_like_tinc() {
     assert!(runtime.meta_connection_infos().is_empty());
 
     assert_eq!(1, runtime.retry_configured_peers_now(&config).unwrap());
-    let (remote_stream, _) = remote_listener.accept().unwrap();
+    let (remote_stream, _) = accept_after_runtime_progress(&remote_listener, &mut runtime);
+    drive_outgoing_meta_output(&mut runtime);
     let mut reader = BufReader::new(remote_stream);
     let mut line = String::new();
     reader.read_line(&mut line).unwrap();
@@ -590,7 +604,7 @@ fn runtime_watchdog_logs_start_state_like_tincd() {
     RuntimeWatchdog::from_timeout(None, Instant::now()).start(&mut runtime);
     assert!(
         runtime
-            .control_log_entries(0, false)
+            .test_log_entries(0, false)
             .iter()
             .any(|entry| entry.contains("Watchdog is disabled"))
     );
@@ -599,7 +613,7 @@ fn runtime_watchdog_logs_start_state_like_tincd() {
     runtime.set_debug_level(0);
     RuntimeWatchdog::from_timeout(Some(Duration::from_millis(1500)), Instant::now())
         .start(&mut runtime);
-    let entries = runtime.control_log_entries(0, false);
+    let entries = runtime.test_log_entries(0, false);
     assert!(
         entries
             .iter()
@@ -1281,8 +1295,8 @@ fn hostnames_option_reverse_resolves_dump_hosts_like_tinc() {
 
     let nodes = dump_nodes(&config, runtime.state(), Some(&runtime));
     assert!(
-        nodes.contains("18 3 beta ") && nodes.contains(" localhost port 0 "),
-        "C sockaddr2hostname() honors Hostnames=yes in node dumps: {nodes}"
+        nodes.contains("18 3 beta ") && nodes.contains(" unknown port unknown "),
+        "C dump_nodes() uses n->hostname for live runtime node dumps and falls back to unknown without a learned UDP address: {nodes}"
     );
     let infos = vec![RuntimeMetaConnectionInfo {
         id: 7,
@@ -1342,8 +1356,12 @@ fn runtime_connection_dump_status_bits_match_tinc() {
 
     assert_eq!(0, runtime.meta_connection_infos()[0].status);
 
-    runtime.meta_connections[0].last_activity = Instant::now() - runtime.ping_interval;
+    runtime.meta_connections[0].edge_peer = Some("beta".to_owned());
+    runtime.local_edge_connections.insert("beta".to_owned(), 7);
+    runtime.meta_connections[0].last_ping_time = Instant::now() - runtime.ping_interval;
+    runtime.next_meta_ping_check = Instant::now() - StdDuration::from_secs(1);
     runtime.poll_once().unwrap();
+    runtime.flush_meta_outputs().unwrap();
     assert_eq!(
         CONNECTION_DUMP_STATUS_PINGED,
         runtime.meta_connection_infos()[0].status

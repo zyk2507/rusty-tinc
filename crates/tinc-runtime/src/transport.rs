@@ -39,9 +39,22 @@ use crate::sptps::{
     SptpsKey, SptpsRecord,
 };
 
-pub const MAX_DATAGRAM_SIZE: usize = MTU + 256;
 pub const RELAY_HEADER_LEN: usize = NODE_ID_LEN * 2;
 pub const LEGACY_SEQNO_LEN: usize = 4;
+pub const LEGACY_CIPHER_MAX_BLOCK_SIZE: usize = 32;
+pub const LEGACY_DIGEST_MAX_SIZE: usize = 64;
+pub const LEGACY_COMPRESSION_OVERHEAD: usize = MTU / 64 + 20;
+pub const MAX_DATAGRAM_SIZE: usize = MTU
+    + LEGACY_SEQNO_LEN
+    + RELAY_HEADER_LEN
+    + LEGACY_CIPHER_MAX_BLOCK_SIZE
+    + LEGACY_DIGEST_MAX_SIZE
+    + LEGACY_COMPRESSION_OVERHEAD;
+pub const MAX_META_BUFFER_SIZE: usize = if MAX_DATAGRAM_SIZE > 2048 {
+    MAX_DATAGRAM_SIZE + 128
+} else {
+    2048 + 128
+};
 pub const DEFAULT_REPLAY_WINDOW_BYTES: usize = 32;
 pub const MAX_LEGACY_SEQNO: u32 = 1_073_741_824;
 pub const SPTPS_PACKET_TYPE_MAC: u8 = 0x02;
@@ -1462,6 +1475,10 @@ impl LegacyUdpCodec {
         self.peers.get_mut(name)
     }
 
+    pub fn remove_peer(&mut self, name: &str) -> Option<LegacyPeerState> {
+        self.peers.remove(name)
+    }
+
     pub fn clear_outgoing_key_state(&mut self, name: &str) {
         if let Some(peer) = self.peers.get_mut(name) {
             peer.clear_outgoing_key_state();
@@ -1981,6 +1998,22 @@ impl SptpsPacketCodec {
     ) -> Result<Vec<u8>, TransportError> {
         let record = self.encode_record_payload_for(target, record_type, payload)?;
         Ok(RelayEnvelope::direct(self.myself, record).encode())
+    }
+
+    pub fn encode_relayed_record(
+        &mut self,
+        target: &str,
+        record_type: u8,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, TransportError> {
+        let Some(target_id) = self.ids.id(target) else {
+            return Err(TransportError::Io(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("unknown target node ID for {target}"),
+            )));
+        };
+        let record = self.encode_record_payload_for(target, record_type, payload)?;
+        Ok(RelayEnvelope::relayed(target_id, self.myself, record).encode())
     }
 
     fn encode_record_for(

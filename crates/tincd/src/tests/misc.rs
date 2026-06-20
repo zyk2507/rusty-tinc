@@ -126,7 +126,12 @@ fn runtime_forwarded_sptps_udp_relay_applies_next_hop_tcp_fallback_like_tinc() {
     alpha.poll_once().unwrap();
     relay.poll_once().unwrap();
 
-    let events = read_meta_events_until(&mut beta_stream, &mut beta_driver, is_sptps_tcp_packet);
+    let events = flush_then_read_meta_events_until(
+        &mut relay,
+        &mut beta_stream,
+        &mut beta_driver,
+        is_sptps_tcp_packet,
+    );
     assert!(
         !events
             .iter()
@@ -513,6 +518,11 @@ fn runtime_sptps_direct_over_min_mtu_uses_plain_meta_tcp_like_tinc() {
         rsa_private_key: None,
         peer_rsa_public_keys: BTreeMap::new(),
     };
+    let Some((_stale_stream, _stale_driver, mut stale_beta_connection)) =
+        active_runtime_connection("beta", alpha_key.clone(), beta_key.clone())
+    else {
+        return;
+    };
     let Some((mut beta_stream, mut beta_driver, mut beta_connection)) =
         active_runtime_connection("beta", alpha_key, beta_key)
     else {
@@ -523,8 +533,15 @@ fn runtime_sptps_direct_over_min_mtu_uses_plain_meta_tcp_like_tinc() {
 
     complete_sptps_udp_exchange(&mut alpha, &mut beta);
 
-    beta_connection.id = 1;
+    stale_beta_connection.id = 1;
+    stale_beta_connection.close_requested = true;
+    stale_beta_connection.options = (PROT_MINOR as u32) << 24;
+    alpha.meta_connections.push(stale_beta_connection);
+
+    beta_connection.id = 2;
     beta_connection.options = (PROT_MINOR as u32) << 24;
+    beta_connection.edge_peer = Some("beta".to_owned());
+    alpha.local_edge_connections.insert("beta".to_owned(), 2);
     alpha.meta_connections.push(beta_connection);
 
     let packet = test_ipv4_ethernet_packet([10, 2, 0, 42]);
@@ -545,7 +562,8 @@ fn runtime_sptps_direct_over_min_mtu_uses_plain_meta_tcp_like_tinc() {
         .unwrap();
     alpha.poll_once().unwrap();
 
-    let events = read_meta_events_until(
+    let events = flush_then_read_meta_events_until(
+        &mut alpha,
         &mut beta_stream,
         &mut beta_driver,
         |event| matches!(event, MetaConnectionEvent::TcpPacket(payload) if payload == &packet),
@@ -706,6 +724,143 @@ fn runtime_sptps_direct_uses_static_via_udp_when_packet_fits_like_tinc() {
 }
 
 #[test]
+fn runtime_sptps_direct_uses_next_hop_when_static_via_mtu_is_too_small_like_tinc() {
+    tinc_test_support::assert_can_create_netns();
+    let alpha_socket = match test_runtime_listen_socket() {
+        Ok(socket) => socket,
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return,
+        Err(error) => panic!("failed to bind alpha runtime listener: {error}"),
+    };
+    let next_hop_receiver = match UdpSocket::bind("127.0.0.1:0") {
+        Ok(socket) => socket,
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return,
+        Err(error) => panic!("failed to bind next-hop UDP receiver: {error}"),
+    };
+    let static_via_receiver = match UdpSocket::bind("127.0.0.1:0") {
+        Ok(socket) => socket,
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return,
+        Err(error) => panic!("failed to bind static-via UDP receiver: {error}"),
+    };
+    next_hop_receiver
+        .set_read_timeout(Some(StdDuration::from_secs(1)))
+        .unwrap();
+    static_via_receiver
+        .set_read_timeout(Some(StdDuration::from_millis(100)))
+        .unwrap();
+    let alpha_addr = alpha_socket.info().address;
+    let next_hop_addr = next_hop_receiver.local_addr().unwrap();
+    let static_via_addr = static_via_receiver.local_addr().unwrap();
+    let alpha_key = test_key(1);
+    let beta_key = test_key(2);
+    let alpha_public_key = alpha_key.public_key();
+    let beta_public_key = beta_key.public_key();
+
+    let alpha_server = config_tree(&[
+        ("Name", "alpha"),
+        ("AddressFamily", "IPv4"),
+        ("StrictSubnets", "yes"),
+    ]);
+    let next_hop_address = format!("{} {}", next_hop_addr.ip(), next_hop_addr.port());
+    let static_via_address = format!("{} {}", static_via_addr.ip(), static_via_addr.port());
+    let alpha_beta_host = config_tree(&[("Subnet", "10.2.0.0/16")]);
+    let alpha_next_hop_host = config_tree(&[("Address", &next_hop_address)]);
+    let alpha_static_via_host = config_tree(&[("Address", &static_via_address)]);
+    let beta_server = config_tree(&[("Name", "beta"), ("AddressFamily", "IPv4")]);
+    let alpha_address = format!("{} {}", alpha_addr.ip(), alpha_addr.port());
+    let beta_alpha_host = config_tree(&[("Address", &alpha_address), ("Subnet", "10.1.0.0/16")]);
+    let alpha_config = RuntimeConfig::from_config_tree_with_hosts(
+        &alpha_server,
+        [
+            ("beta", &alpha_beta_host),
+            ("next-hop", &alpha_next_hop_host),
+            ("static-via", &alpha_static_via_host),
+        ],
+    )
+    .unwrap();
+    let beta_config =
+        RuntimeConfig::from_config_tree_with_hosts(&beta_server, [("alpha", &beta_alpha_host)])
+            .unwrap();
+    let alpha_keys = RuntimeKeys {
+        private_key: Some(alpha_key),
+        peer_public_keys: BTreeMap::from([("beta".to_owned(), beta_public_key)]),
+        rsa_private_key: None,
+        peer_rsa_public_keys: BTreeMap::new(),
+    };
+    let beta_keys = RuntimeKeys {
+        private_key: Some(beta_key),
+        peer_public_keys: BTreeMap::from([("alpha".to_owned(), alpha_public_key)]),
+        rsa_private_key: None,
+        peer_rsa_public_keys: BTreeMap::new(),
+    };
+    let mut alpha = RuntimeDaemonState::new(vec![alpha_socket], &alpha_config, alpha_keys);
+    let mut beta = RuntimeDaemonState::new(Vec::new(), &beta_config, beta_keys);
+
+    complete_sptps_udp_exchange(&mut alpha, &mut beta);
+
+    let packet = test_ipv4_ethernet_packet([10, 2, 0, 42]);
+    let payload_len = test_ipv4_payload([10, 2, 0, 42]).len();
+    {
+        let beta_node = alpha.state.graph.node_mut("beta").unwrap();
+        beta_node.status.reachable = true;
+        beta_node.status.sptps = true;
+        beta_node.options = (PROT_MINOR as u32) << 24;
+        beta_node.min_mtu = DEFAULT_MTU;
+        beta_node.route.next_hop = Some("next-hop".to_owned());
+        beta_node.route.via = Some("static-via".to_owned());
+        beta_node.route.distance = Some(3);
+        beta_node.route.weighted_distance = Some(3);
+    }
+    {
+        let next_hop = alpha.state.graph.node_mut("next-hop").unwrap();
+        next_hop.status.reachable = true;
+        next_hop.status.sptps = true;
+        next_hop.options = (PROT_MINOR as u32) << 24;
+        next_hop.min_mtu = DEFAULT_MTU;
+        next_hop.route.next_hop = Some("next-hop".to_owned());
+        next_hop.route.via = Some("next-hop".to_owned());
+    }
+    {
+        let static_via = alpha.state.graph.node_mut("static-via").unwrap();
+        static_via.status.reachable = true;
+        static_via.status.sptps = true;
+        static_via.options = (PROT_MINOR as u32) << 24;
+        static_via.min_mtu = payload_len - 1;
+        static_via.route.next_hop = Some("static-via".to_owned());
+        static_via.route.via = Some("static-via".to_owned());
+    }
+
+    alpha
+        .push_device_packet(VpnPacket::new(packet).unwrap())
+        .unwrap();
+    alpha.poll_once().unwrap();
+
+    let mut buffer = [0u8; 4096];
+    let (len, source) = next_hop_receiver.recv_from(&mut buffer).unwrap();
+    assert_eq!(alpha.listen_sockets[0].info().address, source);
+    let envelope = RelayEnvelope::decode(&buffer[..len]).unwrap();
+    assert_eq!(NodeId::from_name("beta"), envelope.destination);
+    assert_eq!(NodeId::from_name("alpha"), envelope.source);
+    let record = beta
+        .packet_codec
+        .decode_record("alpha", &buffer[..len])
+        .unwrap();
+    assert_eq!(SPTPS_UDP_ROUTER_PACKET_TYPE, record.record_type);
+    assert_eq!(test_ipv4_payload([10, 2, 0, 42]), record.payload);
+
+    match static_via_receiver.recv_from(&mut buffer) {
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+            ) => {}
+        Ok((len, source)) => {
+            panic!("unexpected UDP datagram to static via {source}: len={len}")
+        }
+        Err(error) => panic!("failed checking static-via UDP socket: {error}"),
+    }
+}
+
+#[test]
 fn runtime_sptps_direct_over_min_mtu_uses_plain_meta_tcp_even_with_static_via_like_tinc() {
     tinc_test_support::assert_can_create_netns();
     let alpha_socket = match test_runtime_listen_socket() {
@@ -812,7 +967,8 @@ fn runtime_sptps_direct_over_min_mtu_uses_plain_meta_tcp_even_with_static_via_li
         .unwrap();
     alpha.poll_once().unwrap();
 
-    let events = read_meta_events_until(
+    let events = flush_then_read_meta_events_until(
+        &mut alpha,
         &mut beta_stream,
         &mut beta_driver,
         |event| matches!(event, MetaConnectionEvent::TcpPacket(payload) if payload == &packet),
@@ -844,8 +1000,8 @@ fn runtime_sptps_direct_over_min_mtu_uses_plain_meta_tcp_even_with_static_via_li
 #[test]
 fn systemd_two_listen_fds_are_reused_and_get_matching_udp_sockets_like_tincd() {
     tinc_test_support::assert_can_create_netns();
-    let first_listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let second_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let first_listener = bind_systemd_test_tcp_listener(2);
+    let second_listener = bind_systemd_test_tcp_listener(3);
     let first_address = first_listener.local_addr().unwrap();
     let second_address = second_listener.local_addr().unwrap();
     let first_fd = unsafe { libc::fcntl(first_listener.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 64) };

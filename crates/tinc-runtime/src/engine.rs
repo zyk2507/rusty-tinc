@@ -175,6 +175,7 @@ pub enum EngineEvent {
         target: String,
         packet: VpnPacket,
         forced_tcp: bool,
+        reason: String,
     },
     Broadcast {
         targets: Vec<String>,
@@ -436,6 +437,7 @@ fn send_to_owner<D: Device, T: PacketTransport>(
                 target: relay,
                 packet,
                 forced_tcp: priority == -1,
+                reason: error.to_string(),
             }]);
         }
 
@@ -760,6 +762,7 @@ mod tests {
                 target: "alpha".to_owned(),
                 packet,
                 forced_tcp: false,
+                reason: "network unreachable".to_owned(),
             }],
             step.events,
             "C send_packet() still runs try_tx() after send_sptps_packet()/send_udppacket() cannot send immediately"
